@@ -1,0 +1,316 @@
+# Doclib SDK: `DoclibClient`
+
+页码规范与历史结果兼容说明见 [PDF 页码范围规范](../page-ranges.md)。
+
+状态: Implemented
+读者: SDK 开发者、`mineru` CLI 开发者、MCP/桌面端集成方
+范围: 本地 doclib client 的公开能力、方法和错误模型
+来源: 由旧 SDK 底稿迁移整理而来；旧底稿已归档删除
+
+## 定位
+
+`DoclibClient` 是本地 doclib 的 Product SDK。它通过 Unix Domain Socket 或 TCP loopback 连接 doclib server，使用本地文档库能力:
+
+- 文件入库。
+- 解析请求与缓存。
+- 全文搜索和文件名搜索。
+- 文件信息查询。
+- watch、exclude、parsing rule 配置。
+- server 状态和关闭。
+
+它不是 v1 Unified API client。v1 API 面向 parse-server / mineru.net；doclib client 面向本机长期运行的文档库。
+
+Doclib SDK 是 doclib 本地 API 的推荐承载方式。MinerU 项目内部除 doclib client 外，不直接通过 HTTP 协议访问 doclib API；外部客户端未来可以绕过 Python SDK，直接使用 doclib HTTP API 与 doclib server 交互。
+
+当前实现类名是 `DoclibClient`，位于 `mineru.doclib.client`。是否额外提供 `MineruClient` 或顶层 `mineru.client` 别名仍是开放问题。
+
+## 构造参数
+
+当前构造签名:
+
+```python
+from pathlib import Path
+
+from mineru.doclib.client import DoclibClient
+
+class DoclibClient:
+    def __init__(
+        self,
+        *,
+        endpoint_path: str | Path | None = None,
+        socket_path: str | Path | None = None,
+        base_url: str | None = None,
+        token: str | None = None,
+        timeout: int = 60,
+        api_prefix: str = "/api/v1",
+    ) -> None: ...
+```
+
+约束:
+
+- 构造 client 不应启动 doclib server。
+- 默认通过 `$MINERU_HOME/doclib.endpoint.json` 发现 doclib endpoint。
+- 默认发现不从启动配置推导 UDS 或 TCP；endpoint 文件不存在或无效时，方法调用抛出 `ServerNotRunningError`。
+- 默认发现会在首次请求前校验 endpoint 与 `/server/status` 的 `server_id`；不匹配的 transport 不会承载业务请求。
+- 当前 endpoint 为 version 3；旧 version 1/2 可用于诊断，但 SDK 拒绝连接并返回 `doclib_upgrade_required`，不会降级为匿名请求。
+- `socket_path` 表示显式 UDS endpoint；`base_url` 只表示显式 TCP endpoint，例如 `http://127.0.0.1:15980`。
+- 显式 `socket_path` / `base_url` 代表调用方明确选择的 server，不执行 endpoint `server_id` 校验。
+- 默认发现从当前启动配置读取 `doclib.auth.token`，不使用可能早于首次服务启动的进程缓存；也可显式传入 `token`。
+- 显式 `socket_path` / `base_url` 必须同时提供 `token`，不会自动将默认配置的凭证发送给其他目标。
+- `socket_path` 和 `base_url` 不能同时传入。
+- 无法连接任何候选 endpoint 时，方法调用抛出 `ServerNotRunningError`。
+- client 提供 `close()`，调用方在 finally 中释放；当前不提供上下文管理器。
+
+示例:
+
+```python
+from mineru.doclib.client import DoclibClient
+
+client = DoclibClient()
+status = client.get_server_status()
+```
+
+## 本机认证与二次开发 {#local-authentication}
+
+首次正常启动服务会生成随机凭证并写入 `$MINERU_HOME/config.yaml` 的 `doclib.auth.token`；
+`MINERU_CONFIG` 可指定其他配置文件。重启和升级复用已有凭证。`MINERU_DOCLIB_AUTH_TOKEN`
+可覆盖文件值，环境注入的凭证不会回写文件。自定义 token 至少包含 32 个 ASCII Bearer 字符。
+
+UDS 与 TCP 的全部 HTTP 接口都要求 `Authorization: Bearer <token>`，包括 status、shutdown、
+读取、扫描、配置、导出和 OpenAPI 文档。缺失或错误凭证返回 HTTP 401、`invalid_doclib_token`，
+不会执行对应业务操作。token 不写入 endpoint、URL、状态或日志；启动配置的 repr/JSON 完全隐藏正文。
+
+直接使用 TCP 的集成程序可在受保护的配置中保存此稳定凭证：
+
+```python
+import os
+
+from mineru.doclib.client import DoclibClient
+
+client = DoclibClient(
+    base_url="http://127.0.0.1:15980",  # 实际端口以 endpoint discovery 为准
+    token=os.environ["DOCLIB_TOKEN"],
+)
+try:
+    status = client.get_server_status()
+finally:
+    client.close()
+```
+
+嵌入式 `create_app(cfg)` / `DoclibServer(..., config=cfg)` 需要宿主显式提供 `cfg.doclib.auth.token`，
+不会为显式配置读取默认文件或生成临时 token。标准进程入口和无参数 `create_app()` 负责持久初始化。
+
+更换凭证的顺序是：使用旧凭证 `mineru server stop`，修改配置或删除 `doclib.auth.token`，再
+`mineru server start`。删除字段后会生成新凭证；其他集成程序需要同步更新。已有 SDK 对象保存构造时的
+凭证，轮换后应重新构造。首次升级到认证版本前，应先用旧版本 CLI 停止旧服务。
+
+凭证授予当前文档库的完整访问权限，共用凭证的程序属于同一个可信范围。配置文件使用 POSIX `0600`
+或 Windows 受保护 DACL；macOS 还会清除文件的扩展 ACL，并在创建临时文件时禁止继承 ACL。
+父目录的权限位及平台 ACL 都不能允许其他普通账户替换文件。权限设置或验证失败时拒绝启动。
+建议继续使用 loopback，不将本机文档库直接暴露给不可信网络。
+
+## Parse 方法
+
+当前稳定入口使用 typed request / response model:
+
+```python
+from mineru.doclib.types import ParseRequest, ParseResponse
+
+def ensure_parse(self, request: ParseRequest) -> ParseResponse: ...
+```
+
+`ParseRequest` 语义:
+
+| 参数 | 说明 |
+|------|------|
+| `path` | 本地文件路径。 |
+| `tier` | `flash`、`basic`、`standard`、`advanced` 或 `None`。`None` 表示使用 doclib 规则和默认策略；非 PDF/image 单文件未指定 tier 时归一为 `flash`，显式质量 tier 报错。 |
+| `page_range` | 页码范围。 |
+| `force` | 跳过已有 done 缓存并重新解析；可复用 active parse，只为未覆盖页创建新 parse。 |
+| `remote` | 是否允许调用远端 parse-server。默认 `False`。远端 URL 来自 doclib config；API Key 优先来自 doclib config，未配置时使用环境变量。 |
+
+返回值是 typed `ParseResponse`:
+
+```python
+class ParseResponse:
+    sha256: str
+    short_id: str | None
+    tier: str
+    page_range: str
+    status: Literal["pending", "done"]
+    cache_hit: bool
+    wait_parse_ids: list[int]
+    created_parse_ids: list[int]
+    reused_parse_ids: list[int]
+    tip: str | None
+```
+
+状态:
+
+`ParseResponse.status` 只有 `pending`（已入队）和 `done`（已完成或命中缓存）两个取值。parse record（`list_parses()` / `get_parse()` 返回的 `ParseInfo.status`）使用更细的状态集合:
+
+| 状态 | 含义 |
+|------|------|
+| `pending` | 已入队，尚未开始解析。 |
+| `parsing` | 正在解析。 |
+| `done` | 解析完成。 |
+| `failed` | 解析失败。 |
+| `superseded` | 已被同文档同范围的新 parse 覆盖，默认不出现在 `list_parses()` 结果中。 |
+
+当前没有稳定的 `DoclibClient.parse(path, ...)` convenience wrapper。CLI 会自行构造 `ParseRequest`，然后调用 `ensure_parse()`，再按需要调用内容读取接口。
+
+## Parse 与 Doc 辅助方法
+
+| 方法 | 说明 |
+|------|------|
+| `list_parses(*, ids=None, doc_ref=None, tier=None, status=None, page_range=None, include_superseded=False, limit=50, offset=0)` | 对应 `GET /parses`，按 ids、`doc_ref`、tier、status 或 page_range 查询 parse records 和覆盖状态；`include_superseded` 控制是否返回已被覆盖的 parse。 |
+| `get_parse(parse_id)` | 对应 `GET /parses/{id}`，查询单条 parse record。 |
+| `get_doc_content(doc_ref, *, tier, page_range=None, after=None, limit=30000, format="markdown", no_marker=False)` | 对应 `GET /docs/{doc_ref}/content`，从保存的 JSON 结果读取时转换。 |
+| `read_content(locator, *, after=None, context=0, limit=30000, format="markdown", image_format="jpeg", no_marker=False)` | 对应 `GET /content`，按单点或页范围 locator 读取内容或图片。 |
+| `export_doc_content(doc_ref, request)` | 对应 `POST /docs/{doc_ref}/exports`，导出结构化内容。 |
+| `invalidate(request)` | 对应 `POST /invalidate`，将已有解析结果标记为失效；不自动触发重新解析。 |
+
+`parse_status(sha256, tier)` 不再作为 NEXT 稳定方法；调用方应使用 `list_parses(doc_ref=..., tier=...)` 或 `get_parse(parse_id)`。`get_doc_content()` 是 doclib 层能力，不等同于 v1 Files API 的 `GET /v1/files/{id}/content`。
+
+`force=True` 与 `invalidate()` 不等价。`force=True` 跳过 done cache，并通过 `wait_parse_ids` 等待复用或新建的 active parse；旧结果仍然有效。`invalidate()` 会让旧结果退出缓存命中、读取合并、搜索刷新和 compaction 选择。
+
+Markdown 响应中的 visual block 图片使用 `doc:.../page:.../block:...` locator。非空图片 locator 可以原样传给 `read_content(..., format="image")`；空 locator 表示该 block 没有可用图片。SDK 调用方不应依赖或拼接 Middle JSON 内部的 `image_path`。
+
+请求定位器的 `page:` 复用输入页范围语法：数字、`rN`、`1-5`、`r3-r1`、`1,3,r1`、`all`。`r1` 表示最后一页，`rN` 和 `all` 需要文档总页数；返回定位器及块引用使用实际页码。带 block/char、图片读取和非零 context 都要求选中单页。
+
+Markdown 文档定位或单点页定位在 `context=0` 时，页内截断的 `next_request` 同时携带文档 `locator` 和已消费位置 `after`。
+调用方应将这两个字段一起传给下一次 `read_content()`，从未完成的当前页继续读取。当前页完成后，服务继续建议下一页。
+块级 `after` 表示该块已完成，字符级 `after` 从对应偏移继续，页级 `after` 从下一页开始。
+
+```python
+result = client.read_content("doc:ab12cd3/tier:flash/page:1", limit=1000)
+if result.next_request is not None:
+    result = client.read_content(result.next_request.locator, after=result.next_request.after, limit=1000)
+```
+
+范围读取结束后 `next_request=null`。范围内截断时，同时返回规范化 `locator` 和实际页码 `after`；两者可直接传给下一次 `read_content()`，不会读入未选择的页面：
+
+```python
+result = client.read_content("doc:ab12cd3/tier:flash/page:1,3", limit=1000)
+if result.next_request is not None:
+    result = client.read_content(result.next_request.locator, after=result.next_request.after, limit=1000)
+```
+
+## Search 与文件信息
+
+```python
+def search(
+    self,
+    query: str,
+    *,
+    file_type: str | None = None,
+    tier: Tier | None = None,
+    min_tier: Tier | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> SearchResponse: ...
+
+def find(self, query: str, *, ext: str | None = None, limit: int = 50, offset: int = 0) -> FindResponse: ...
+
+def get_file_by_path(self, path: str) -> FileInfoResponse: ...
+```
+
+按路径查询文件信息使用 `get_file_by_path(path)`，对应 `GET /files/by-path`；不存在独立的 `info()` 方法。
+
+响应类型:
+
+| 方法 | 响应 |
+|------|------|
+| `search()` | `SearchResponse`，包含全文结果、snippet、files、可空 tier；支持 `file_type`、`tier`、`min_tier` 过滤。 |
+| `find()` | `FindResponse`，包含文件名前缀搜索结果；支持 `ext` 过滤及 `limit/offset` 分页。 |
+| `get_file_by_path()` | `FileInfoResponse`，包含文件元信息、doc metadata 和 parse tiers。 |
+
+`search()` 的 `files` 返回与文档 SHA 关联的全部 file aliases，按 file id 降序排列；每项包含 path、filename、ext 和 status。已索引的 orphan 文档使用空列表。active 优先只属于非 JSON CLI 展示策略，不改变 SDK 响应。解析内容的 `tier` 表示索引来源 tier；直接索引的 text 源内容为 `null`。传入 `tier` 或 `min_tier` 时，`tier=null` 的结果不参与匹配。
+
+`find()` 默认仅对最后一个分词应用前缀匹配，显式尾部 `*` 等价。结果按相关性及 file id 排序，在扩展名过滤和文件状态刷新后计算 `total` 并分页。`limit` 必须为正整数，`offset` 必须为非负整数；偏移超过末尾时仍返回完整有效匹配数。HTTP `GET /api/v1/find` 接受同名参数，同步与异步接口保持一致。
+
+## Remote API 方法
+
+| 方法 | 响应 |
+|------|------|
+| `get_remote_usage()` | `RemoteUsageResponse`，返回当前配置 Remote API 的 access level、billing period、current usage 和 limits。 |
+
+该方法通过 doclib 读取 Remote URL 和有效 API Key，并调用本地 doclib route `GET /api/v1/remote-usage`。它不返回 Local Parse
+Server 运行统计。
+
+## Config 方法
+
+Doclib client 暴露运行时配置能力:
+
+| 方法 | 说明 |
+|------|------|
+| `get_config()` / `get_config_key()` | 返回运行时 KV 配置。 |
+| `set_config()` / `unset_config()` | 更新或删除运行时 KV 配置。 |
+| `add_watch()` / `list_watches()` / `remove_watch()` | 管理 watch target。 |
+| `add_exclude_rule()` / `list_exclude_rules()` / `remove_exclude_rule()` | 管理排除规则。 |
+| `add_parsing_rule()` / `list_parsing_rules()` / `remove_parsing_rule()` | 管理解析规则。 |
+
+这些方法对应 [配置体系](../config.md) 中的运行时配置，不负责启动前配置。
+
+## Server 方法
+
+| 方法 | 说明 |
+|------|------|
+| `get_server_status()` | 返回 doclib、队列、watch 和 parse-server 状态。 |
+| `shutdown_server()` | 通过宿主回调请求 doclib server 优雅关闭。 |
+
+`get_server_status()` 是 CLI、MCP 和桌面端判断本地能力的主入口。
+
+`shutdown_server()` 返回 `accepted=True` 表示宿主已接受关闭请求，资源清理和进程退出仍在进行。
+标准 `mineru server` 入口已经绑定 Uvicorn 停机回调，CLI 会等待服务退出并释放文档库目录锁。
+
+嵌入式 `create_app(cfg)` 需要宿主在启动服务前设置 `app.state.doclib_state.shutdown`；
+直接构造 `DoclibServer(state, ...)` 时，在传入的 `state` 上设置 `shutdown` 回调。
+缺少回调时，关闭接口返回 `service_unavailable` 错误，SDK 抛出相应的 `MineruError`。
+回调应发起宿主的优雅退出，由 ASGI lifespan 清理后台任务、托管子进程和数据库；
+回调自身应及时返回，不等待当前 HTTP 请求所属的服务完全退出。
+
+下面示例接收已配置 `doclib.auth.token` 的 `cfg`，为自定义 Uvicorn 宿主绑定回调：
+
+```python
+import uvicorn
+
+from mineru.config import Config
+from mineru.doclib.app import create_app
+
+
+def serve_doclib(cfg: Config) -> None:
+    """为嵌入式 Doclib 绑定宿主停机回调，并启用生命周期清理。"""
+    app = create_app(cfg)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=15980, lifespan="on"))
+
+    def request_shutdown() -> None:
+        """请求 Uvicorn 优雅退出，资源回收由应用生命周期完成。"""
+        server.should_exit = True
+
+    app.state.doclib_state.shutdown = request_shutdown
+    server.run()
+```
+
+## 错误模型
+
+doclib client 从服务端 error envelope 还原 `MineruError`：
+
+| 场景 | 错误 |
+|------|------|
+| UDS / TCP 连接失败 | `ServerNotRunningError`。 |
+| 服务端返回 error envelope | `MineruError`，保留 `code`、`message`、`param`。 |
+| 服务端返回非 JSON | `MineruError("internal_error", ...)`。 |
+
+SDK 不应把 doclib 内部异常原样泄漏给调用者。
+
+## 隐私策略
+
+`ParseRequest.remote=False` 是默认行为，表示不得上传到远端。此时 doclib 只能使用本地 flash 或 local parse-server。
+
+只有调用方显式设置 `ParseRequest.remote=True`，doclib 才可以连接 remote parse-server 或 mineru.net。即便远端可用，SDK 也不能自动越过该开关。
+
+## 接口扩展
+
+当前入口为 `DoclibClient`，没有 `MineruClient` 别名、`raw=True` 或 `parse(path, ...)` 便利方法。
+新增接口及异步客户端是否提供，统一在 [当前待办](../backlog.md) 讨论，不作为当前 SDK 承诺。

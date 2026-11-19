@@ -1,0 +1,144 @@
+# 命令行工具
+
+MinerU 提供两个主要命令树：`mineru` 是面向交互和 Agent 工作流的文档库客户端，`mineru-kit` 提供无状态解析、服务、模型、Router 和 WebUI 工具。
+
+## 文档库 CLI
+
+使用 `mineru --help` 查看全部文档库命令。最常见的解析方式是：
+
+```bash
+mineru parse report.pdf --pages all -o report.md
+```
+
+未指定 `-o/--output` 时，渲染结果写入标准输出。PDF 默认解析前 10 页；使用 `--pages all` 解析整份文档。文档库负责入库、缓存、后台解析、阅读、搜索和清理。
+
+使用以下命令管理本地文档库服务：
+
+```bash
+mineru server start
+mineru server status
+mineru server stop
+```
+
+Doclib 首次启动自动生成本机 token，保存到实际 `config.yaml` 的 `doclib.auth.token`；
+重启和升级保持不变，CLI 自动读取并携带。`MINERU_DOCLIB_AUTH_TOKEN` 可覆盖文件值。
+UDS/TCP 的全部 HTTP 接口（包括状态、导出和 shutdown）都要求 Bearer token。
+直接集成时使用 `DoclibClient(base_url=..., token=...)` 或 `Authorization: Bearer <token>`；
+实际地址以 `doclib.endpoint.json` 为准。多个程序共用 token 就共享该文档库的完整权限。
+
+首次升级到带认证的版本前，请先用旧 CLI 停止服务。轮换 token 时先停止服务，再修改或删除
+`doclib.auth.token`，最后启动；集成程序同步更新凭证。配置文件需限制其他普通账户访问，
+POSIX 使用 `0600`、Windows 使用受保护 DACL，权限无法落实时服务拒绝启动。
+
+各命令的权威参数以 `mineru <command> --help` 为准。
+
+## 解析、阅读、导出与等待
+
+`mineru parse` 组合了四个容易混淆的行为，编写脚本时应分别对待：
+
+| 维度 | 默认行为 | 需要知道的差异 |
+| --- | --- | --- |
+| 请求页范围 | PDF 前 10 页；`--pages all` 请求全部页 | 请求全部页不等于标准输出一次返回全部文字 |
+| 标准输出阅读窗口 | 30,000 字符软限制；`--limit` 调整，`--after` 从内容游标续读 | 还有后续内容时，输出末尾附加含下一条命令的 `<!-- Next: mineru parse ... -->` 标记 |
+| 文件导出 | `-o <路径>` 写出**本次请求页范围内**的完整渲染内容 | 导出路径不经过 `--limit`/`--after`，不是把标准输出重定向到文件；导出整份文档仍需 `--pages all` |
+| 客户端等待 | `--wait` 最多等待 60 秒；`--no-wait` 立即返回 | 等待超时退出码为 1，但任务不会因此失败或取消 |
+
+等待超时是客户端期限，不是任务失败：解析会在文档库中继续执行。`--json` 模式的响应携带错误码 `parse_wait_timeout`，并提示重新执行同一命令继续等待；文本模式输出任务摘要并指向 `mineru show parse <id>`。较慢设备或首次运行（含模型下载）建议显式加大等待窗口：
+
+```bash
+# 无状态转换整份文档
+mineru-kit parse document.pdf -o document.md --tier standard
+
+# 文档库解析并完整导出，显式等待 10 分钟
+mineru parse document.pdf --pages all -o document.md --wait 600
+```
+
+自动化时区分三种用法：Agent 阅读关注有限输出、定位符与续读；文件转换关注完整产物；异步任务关注任务状态与客户端等待期限。不要把它们合并成单一「命令成功/失败」判断。
+
+## 无状态与服务工具
+
+使用 `mineru-kit --help` 查看所有工具。
+
+### 批量解析
+
+```bash
+mineru-kit parse report.pdf -o report.md --tier standard
+mineru-kit parse ./documents -o ./output --format zip
+```
+
+`mineru-kit parse` 不使用文档库数据库或缓存，支持本地解析和显式 V1 远程解析。tier、页范围和输出参数以 `mineru-kit parse --help` 为准。
+
+### V1 API Server
+
+```bash
+mineru-kit api-server --host 127.0.0.1 --port 8000 --tier standard
+```
+
+在浏览器打开 `http://127.0.0.1:8000/docs` 查看自动生成的 OpenAPI 文档。当前服务接口统一位于 `/v1/*`；已删除的 `/file_parse` 和 `/tasks` 不再提供。
+
+### 硬件诊断
+
+硬件推荐和诊断：
+
+```bash
+mineru-kit hardware detect --json
+mineru-kit hardware info --json
+```
+
+4.1 的 detect 与 `api-server --tier auto` 共用推荐逻辑，可能触发 ONNX 校准；info 只读报告环境与已有校准记录。档位上限和设备规则见[档位与运行环境](tiers.md)。
+
+### 单文件同步服务
+
+需要单文件同步 HTTP 返回时，另行启动包装服务：
+
+```bash
+mineru-kit file-parse-server --api-url http://127.0.0.1:8000
+```
+
+包装服务默认端口为 8003，接收 multipart 并通过 Tasks 调用上游；详见 [file-parse 接口](file_parse.md)。
+
+### Gradio WebUI
+
+```bash
+mineru-kit webui --server-name 127.0.0.1 --server-port 7860
+```
+
+未传 `--api-url` 时，Gradio 会托管 loopback `mineru-kit api-server`；传入后只连接指定的 V1 服务。`mineru-webui` 保留为命令名兼容别名，接受相同的新版参数，不恢复旧 Gradio 参数或 HTTP 路由。
+
+Gradio 只保留 `--tier auto|flash|basic|standard|advanced`，默认 `auto`，仅用于自托管 API Server 的上限。旧参数 `--api-server-tier` 已移除。界面与 Tasks 共享默认选档顺序 Standard → Basic → Flash → Advanced；仅开放 Advanced 时自动选择它。
+
+### Router 与 VLM Server
+
+```bash
+mineru-kit router --host 127.0.0.1 --port 8002 --local-gpus auto
+mineru-kit vlm-server --engine auto --port 30000
+```
+
+`mineru-router` 保留为 `mineru-kit router` 的命令名别名。Router 只暴露 V1 API，并且只接受文档中声明的 worker 参数。
+
+使用 `--admin-api-key` 或 `MINERU_ROUTER_ADMIN_API_KEY` 启用独立认证的 upstream 注册、查询和安全注销接口。动态清单仅当前进程有效；下层 Router 可作为 upstream 接入。[管理 API 与级联示例](./tasks.md#upstream)。
+
+## 环境变量
+
+- `MINERU_HOME`：MinerU 配置、缓存和文档库状态的根目录。
+- `MINERU_CONFIG`：显式指定 `config.yaml` 路径。
+- `MINERU_MODEL_SOURCE`：模型源，例如 `huggingface`、`modelscope` 或 `local`。
+- `MINERU_API_URL` / `MINERU_API_KEY`：API 客户端默认使用的 V1 地址和 Bearer Key。
+- `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`：Gradio 托管本地 V1 服务的启动超时，默认 `300` 秒。
+- `MINERU_API_ENABLE_FASTAPI_DOCS`：是否为 V1 API Server 启用 `/docs`、`/openapi.json` 和 `/redoc`，默认 `true`。
+- `MINERU_PDF_RENDER_TIMEOUT` / `MINERU_PDF_RENDER_THREADS`：PDF 渲染超时和 worker 数量。
+- `MINERU_PROCESSING_WINDOW_SIZE`：大文档处理窗口大小。Flash 原生文本路径仅渲染有视觉块的页面，仍遵守该窗口边界、渲染超时和 worker 配置，并按 32 MiB 像素预算进一步分批。OCR 和其他档位保持整窗口渲染。
+- `MINERU_MALLOC_TRIM`：默认关闭；仅 `1/true/yes/on` 启用，忽略大小写和首尾空白。Linux 上可用时，在推理窗口及 PDF 文档清理后尝试归还当前进程的 glibc 空闲堆页；Flash 原生路径仅在文档结束时尝试。其他平台或缺少符号时为空操作，不释放存活对象、GPU 显存或渲染子进程内存。参见[内存压测方法](./pdf_memory.md)。
+- `MINERU_MODEL_ONNX_DEVICE`：4.1 ONNX 设备选择 `auto/cpu/gpu`，覆盖文件配置；Torch 与 VLM 独立配置。
+- `MINERU_INTRA_OP_NUM_THREADS` / `MINERU_INTER_OP_NUM_THREADS`：每个 ONNX 会话的算子内 / 算子间线程数，默认分别为 `4` / `1`，包括 GPU 会话中的 CPU 算子。显式正数参数或会话线程配置优先于环境变量；环境变量缺失、非整数或非正数时使用默认值。这不是整个进程的线程总数上限，也不会自动检测容器 CPU 配额。
+
+当前默认值以各命令的 `--help` 和[模型源说明](./model_source.md)为准。
+
+## PDF 页码选择
+
+使用 `--pages "1-5,8,r3-r1"`：页码从 1 开始，包含区间两端，`r1` 表示最后一页，`all` 表示全部。
+结果去重并按原页序排列；部分越界取有效交集，倒序或选不到页面时返回 `page_range_invalid`。
+省略页码时 `mineru parse` 默认前 10 页，`mineru-kit parse`、Python 和 Gradio 默认全部。
+新请求使用新规范；历史正整数半角 `~` 结果可直接读取，无需重建 Doclib 缓存。
+结果返回值和新缓存使用 `-`，全角 `～` 及负号倒数页码不受支持。
+档位与默认选择见[档位与运行环境](tiers.md)，升级注意事项见[迁移指南](../reference/migration_4.md)。

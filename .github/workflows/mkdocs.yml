@@ -1,0 +1,94 @@
+name: Docs
+
+on:
+  push:
+    branches: [master, dev, next]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  # 正式发布不在推送途中被取消；PR 和开发分支只保留最新检查。
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  docs-build-check:
+    name: Docs build check (no deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.changes.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Determine whether docs changed
+        id: changes
+        run: python scripts/ci/changes.py
+      - uses: astral-sh/setup-uv@v7
+        if: steps.changes.outputs.docs == 'true'
+        with:
+          cache-dependency-glob: docs/requirements.txt
+      - name: Install docs dependencies
+        if: steps.changes.outputs.docs == 'true'
+        run: |
+          uv venv
+          uv pip install -r docs/requirements.txt
+      - name: Build docs (strict)
+        if: steps.changes.outputs.docs == 'true'
+        run: |
+          uv run --no-project --no-sync python -m mkdocs build --strict
+          uv run --no-project --no-sync python docs/_hooks/check_site.py site
+      - name: Retain the verified site
+        if: >-
+          steps.changes.outputs.docs == 'true' && github.event_name == 'push' &&
+          github.ref == 'refs/heads/master' && github.repository == 'opendatalab/MinerU'
+        uses: actions/upload-artifact@v6
+        with:
+          name: docs-site
+          path: site/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  docs-publish:
+    name: Publish docs to GitHub Pages
+    needs: docs-build-check
+    if: >-
+      needs.docs-build-check.outputs.changed == 'true' && github.event_name == 'push' &&
+      github.ref == 'refs/heads/master' && github.repository == 'opendatalab/MinerU'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: docs-gh-pages
+      cancel-in-progress: false
+    steps:
+      - name: Require release token
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "RELEASE_TOKEN is empty; refusing to skip publishing." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+      - uses: actions/download-artifact@v7
+        with:
+          name: docs-site
+          path: site
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+      - name: Publish the verified site without rebuilding
+        run: uvx --from ghp-import==2.1.0 ghp-import -n -p -f site

@@ -1,0 +1,452 @@
+# 配置体系
+
+页码规范与历史结果兼容说明见 [PDF 页码范围规范](page-ranges.md)。
+
+状态: Draft
+读者: 想了解 doclib / mineru 配置的用户、实现配置能力的核心开发者
+范围: 本地配置、远端配置、解析参数、环境变量和优先级规则
+非目标: 替代 CLI 参数手册；替代部署文档
+来源: 配置专题文档仍待继续核对
+
+## 1. 定位
+
+ONNX 小模型新增 `model.onnx_device: auto | cpu | gpu`，环境变量为
+`MINERU_MODEL_ONNX_DEVICE`。首次实际使用时自动选择并保存，独显优先；
+该字段只作为 ONNX 选型输入和持久化偏好；模块间运行设备通过进程快照共享，修改默认设备需重启进程。
+集显测速、重新选择及 DirectML 厂商预设见 [ONNX 设备选择](onnx-device.md)。
+
+配置体系定义 MinerU 如何在不同启动阶段得到最终行为。
+
+MinerU 有两类配置：
+
+- **启动前配置**：doclib server 启动之前就必须知道，通常来自文件形式的配置或内置默认值。
+- **运行时配置**：doclib server 启动之后可从 SQLite 读取和修改，由 `config`、`watches`、`exclude_rules`、`parsing_rules` 等表承载。
+
+启动前还存在一个 bootstrap 根目录:
+
+- `MINERU_HOME` 决定 MinerU home，默认 `~/.mineru`。
+- 默认配置文件路径是 `$MINERU_HOME/config.yaml`。
+- 默认 DB、日志和 UDS socket 从 `MINERU_HOME` 派生；默认 `data_dir` 是 `$MINERU_HOME/doclib`，其下包含 `parsed/` 和 `temp/`。
+- `MINERU_CONFIG` 仍可显式指定配置文件路径；`MINERU_HOME` 只影响默认 home 和默认配置文件位置。
+
+Python 模块导入不装载启动配置。默认调用路径使用 `get_config()`：第一次访问时读取
+文件和环境并校验，之后复用进程默认配置；配置文件路径、存在状态和字段来源查询也使用
+同一份首次装载结果。环境和文件变更不会自动刷新这份配置。
+
+```python
+from mineru.config import get_config, load_config
+
+settings = get_config()  # 读取并缓存进程默认配置
+loaded = load_config()  # 按当前环境独立装载，不替换进程默认配置
+```
+
+原来的模块级 `config` 实例已移除，内部调用统一使用显式访问函数。`load_config()`
+返回配置对象及其来源信息；`Config()` 只构造模型默认值，不读取 YAML 或应用环境覆盖。
+依赖 `MINERU_HOME` 的默认路径在每次构造对象时解析。Doclib 的
+`create_app(cfg)` 会保存传入配置的独立副本，并使用其中的全局日志级别补全服务日志设置。
+
+### Doclib 本机凭证
+
+`doclib.auth.token` 是启动配置。标准服务首次启动时在配置锁内生成并写入实际配置文件，后续启动复用；
+`MINERU_DOCLIB_AUTH_TOKEN` 可以覆盖文件值且不回写。普通 `load_config()` / `get_config()` 不生成凭证。
+token 以 `SecretStr` 保存，repr/JSON 完全脱敏；不得放入运行时 `/configs` 或诊断输出。
+显式 `create_app(cfg)` 需要宿主提供 token。轮换前先停止服务，修改或删除该字段后再启动。
+文件权限、SDK 自动读取及直接 TCP 调用见 [Doclib SDK 本机认证](sdk/doclib-client.md#local-authentication)。
+
+### 远程 VLM {#remote-vlm}
+
+`model.vlm` 是所有本地解析入口的 VLM 默认配置，适用于 API server、Python
+`parse()` / `parse_async()` 和 `mineru-kit parse`。Standard/Advanced 将 VLM 推理交给
+远程 MinerU OpenAI-compatible 服务，本地继续执行 Hybrid 处理；Flash/Basic 不调用远程 VLM。
+上游须部署支持 MinerU 文档理解输出的模型，并提供 `/v1/models` 和 `/v1/chat/completions`。
+
+```yaml
+model:
+  vlm:
+    server_url: http://127.0.0.1:30000/v1
+    api_key: ${VLM_API_KEY:-}
+    model: ""
+    http_timeout: 600
+    max_concurrency: 100
+```
+
+未配置 `server_url` 或显式设为空字符串时使用本地 VLM。地址可使用 HTTP/HTTPS
+服务根地址或以 `/v1` 结尾的地址；反向代理前缀会保留，例如 `https://host/proxy/v1`
+对应 `https://host/proxy/v1/chat/completions`。URL 不接受内嵌用户名、密码、query 或 fragment。
+`api_key` 可为空；`model` 为空时要求上游模型列表恰好包含一个模型，多模型服务须显式指定模型名。
+显式模型名也会通过模型列表校验。`http_timeout` 单位为秒，`max_concurrency` 是 VLM
+推理请求并发，两者均为正整数；API 的 `--concurrency` 则控制解析任务并发。
+
+环境变量包括 `MINERU_MODEL_VLM_SERVER_URL`、`MINERU_MODEL_VLM_API_KEY`、
+`MINERU_MODEL_VLM_MODEL`、`MINERU_MODEL_VLM_HTTP_TIMEOUT` 和
+`MINERU_MODEL_VLM_MAX_CONCURRENCY`。API 启动时的优先级为：显式启动参数 > 环境变量 >
+YAML > 默认值。启动参数及示例见 [api-server](cli/mineru-kit-api-server.md)。
+
+Python 的 `create_app()`、`MinerUParser`、`parse()` / `parse_async()` 以及底层分析入口
+可传入 `vlm_config: VlmConfig | None`：`None` 使用全局设置；显式对象完整覆盖全局设置。
+应用与解析器各自保存配置副本，不修改全局配置或进程环境。
+
+```python
+from mineru.config import VlmConfig
+from mineru.parser import parse
+
+result = parse("document.pdf", tier="standard")  # 使用全局 model.vlm
+local_result = parse("document.pdf", vlm_config=VlmConfig())  # 本次使用本地 VLM
+```
+
+远程模式不会自动回退本地 VLM。旧底层环境变量 `MINERU_VL_API_KEY`、
+`MINERU_VL_MODEL_NAME` 若与有效的新配置冲突，会明确报错；应清除旧变量并使用上述
+`MINERU_MODEL_VLM_*` 配置。未配置远程地址时，旧 `MINERU_VL_SERVER` 不会启用远程 VLM。
+
+Markdown render 同样读取启动前 `config.yaml`，当前支持以下配置：
+
+```yaml
+render:
+  latex_delimiters:
+    display:
+      left: "$$"
+      right: "$$"
+    inline:
+      left: "$"
+      right: "$"
+```
+
+四个 delimiter 必须为非空字符串。缺省值如上；环境变量可按现有字段路径规则覆盖，
+例如 `MINERU_RENDER_LATEX_DELIMITERS_INLINE_LEFT`。
+
+PDF 的 LLM 辅助后处理同样读取启动前 `config.yaml`：
+
+```yaml
+llm_aided:
+  api_key: ${MINERU_LLM_API_KEY:-}
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  model: qwen3.8-flash
+  enable_thinking: false
+  max_concurrency: 16
+  allow_partial_title_leveling: false
+  features:
+    title_leveling: false
+    cross_page_table_cell_merge: false
+```
+
+两个功能默认关闭并共享同一套 OpenAI-compatible 连接参数。`title_leveling` 在严格
+`MiddleJson.pages` 上优化标题层级，默认仅对 `MiddleJson.is_full_document=true` 的整本 PDF 执行。
+设置 `allow_partial_title_leveling: true` 后，抽页结果也可根据本次选中的标题建立局部层级，
+包括 Demo 默认截取的前 20 页、中间片段和非连续选页。抽页结果的 `is_full_document` 为 `false`，
+页码对应原文件。`features.title_leveling` 是标题分级的总开关。
+`cross_page_table_cell_merge` 只消费确定性后处理
+已经写入的 `continues_prev`，再把逐单元格的 `0/1` 结果写入后表根块 `cell_merge`。两个功能
+通过同一个异步客户端并发请求，`max_concurrency` 是不小于 1 的共享请求上限，默认值为 16。
+标题分级结果允许 1 到 6，段落标题的 1 会归一为 2，最终严格标题层级范围为 2 到 6。前置
+MinerU VLM 的跨页单元格检测保持关闭。任一功能启用时，`api_key`、`base_url` 和 `model`
+均必须为非空字符串；省略 `enable_thinking` 时不会发送该扩展参数。
+
+环境变量可覆盖任意强类型字段，例如 `MINERU_LLM_AIDED_API_KEY`、
+`MINERU_LLM_AIDED_MAX_CONCURRENCY`、
+`MINERU_LLM_AIDED_ALLOW_PARTIAL_TITLE_LEVELING`、
+`MINERU_LLM_AIDED_FEATURES_TITLE_LEVELING` 和
+`MINERU_LLM_AIDED_FEATURES_CROSS_PAGE_TABLE_CELL_MERGE`。
+
+配置必须服务两个产品原则：
+
+- 隐私优先：任何配置都不能导致静默上传文档。
+- 质量优先：PDF/image 主动阅读未指定 tier 时使用默认选择策略，不能静默降级到 `flash`；OFD/EPUB/Office/HTML/MHTML/CSV/TSV 按实际能力归一为 `flash`；其它 text 直接读取。
+
+全局日志级别由 `log.level` 控制，默认 `info`，可选 `trace`、`debug`、`info`、
+`warning`、`error`、`critical`。环境变量 `MINERU_LOG_LEVEL` 可覆盖 YAML；
+该配置作用于当前进程的 Loguru 默认 stderr sink，不会移除宿主程序显式添加的
+自定义 sink。`doclib.log.level` 是 Doclib 进程日志级别的局部覆盖；api-server
+启动参数 `--log-level` 是服务侧（Uvicorn/HTTP 访问/服务自身 stdlib 日志）的局部
+覆盖，不影响 Loguru 默认 sink。
+
+## 2. 两阶段配置模型
+
+### 2.1 启动前配置
+
+启动前配置解决“server 还没起来，不能读数据库”的问题。
+
+这类配置包括：
+
+| 分组 | 字段 | 默认值 | 说明 |
+|------|------|--------|------|
+| 全局日志 | `log.level` | `info` | Loguru 默认 stderr sink 级别；可用 `MINERU_LOG_LEVEL` 覆盖 |
+| UDS | `doclib.uds.enabled` | `auto` | `auto` / `true` / `false`；`auto` 时当前 Python runtime 支持 UDS 则启用，否则关闭 |
+| UDS | `doclib.uds.path` | `~/.mineru/doclib.sock` | CLI / doclib 通信 socket，默认取 `$MINERU_HOME/doclib.sock` |
+| UDS | `doclib.uds.permission` | `0o600` | socket 权限 |
+| TCP | `doclib.tcp.enabled` | `auto` | `auto` / `true` / `false`；`auto` 时 UDS 不可用则启用，作为 Windows fallback |
+| TCP | `doclib.tcp.host` | `127.0.0.1` | TCP 监听地址 |
+| TCP | `doclib.tcp.port` | `15980` | TCP 监听端口 |
+| TCP | `doclib.tcp.strict_port` | `False` | 端口占用时是否报错 |
+| TCP | `doclib.tcp.port_probe_count` | `100` | `strict_port` 为 `False` 时从 `port` 起向后探测的端口数量上限 |
+| TCP | `doclib.tcp.backlog` | `128` | socket backlog |
+| TCP | `doclib.tcp.timeout` | `600` | keep-alive timeout |
+| log | `doclib.log.dir` | `~/.mineru/logs` | 默认日志目录；未单独配置的日志路径会从该目录派生 |
+| log | `doclib.log.app_path` | unset → `<dir>/doclib.log` | Python application 日志路径 |
+| log | `doclib.log.access_path` | unset → `<dir>/doclib.access.log` | HTTP access 日志路径 |
+| log | `doclib.log.stdout_path` | unset → `<dir>/doclib.stdout.log` | server 子进程 stdout fallback 日志路径 |
+| log | `doclib.log.stderr_path` | unset → `<dir>/doclib.stderr.log` | server 子进程 stderr fallback 日志路径 |
+| log | `doclib.log.parse_server_stdout_path` | unset → `<dir>/doclib.parse-server.stdout.log` | managed parse-server stdout 日志路径 |
+| log | `doclib.log.parse_server_stderr_path` | unset → `<dir>/doclib.parse-server.stderr.log` | managed parse-server stderr 日志路径 |
+| log | `doclib.log.level` | unset → `log.level` | Doclib 进程日志级别局部覆盖 |
+| doclib | `doclib.endpoint_path` | `~/.mineru/doclib.endpoint.json` | 当前 server 实际可用 endpoint discovery 文件 |
+| doclib | `doclib.data_dir` | `~/.mineru/doclib` | 数据目录，默认取 `$MINERU_HOME/doclib`，但仍可通过配置文件或环境变量覆盖 |
+| doclib | `doclib.managed_parse_server.host` | `127.0.0.1` | managed parse-server 监听地址 |
+| doclib | `doclib.managed_parse_server.port` | `16580` | managed parse-server 监听端口 |
+| doclib | `doclib.managed_parse_server.strict_port` | `False` | 端口占用时是否报错 |
+| doclib | `doclib.managed_parse_server.port_probe_count` | `100` | `strict_port` 为 `False` 时从 `port` 起向后探测的端口数量上限 |
+| doclib | `doclib.ingest_workers` | `2` | ingest worker 数 |
+| doclib | `doclib.parse_workers` | `2` | parse worker 数 |
+| doclib | `doclib.scan_interval_sec` | `300` | watch 扫描间隔 |
+| doclib | `doclib.device_check_interval_sec` | `5` | 可插拔设备检测间隔 |
+| doclib | `doclib.ingest_lock_timeout_sec` | `60` | ingest 锁超时 |
+| doclib | `doclib.parse_lock_timeout_sec` | `1800` | parse 锁超时 |
+| doclib | `doclib.scan_lock_timeout_sec` | `1800` | scan 锁超时 |
+| doclib | `doclib.compaction_interval_sec` | `3600` | compaction 间隔 |
+| doclib | `doclib.parse_server_health_check_interval_sec` | `30` | parse-server 健康检查间隔 |
+| doclib | `doclib.parse_server_probe_timeout_sec` | `10` | parse-server 探测超时 |
+| doclib | `doclib.parse_server_startup_grace_sec` | `30` | managed parse-server 启动宽限时间 |
+| doclib | `doclib.parse_server_startup_timeout_sec` | `600` | managed parse-server 启动硬超时；超时后进入重启策略 |
+| doclib | `doclib.parse_server_stop_timeout_sec` | `10` | managed parse-server 停止超时 |
+| model | `model.base_dir` | `~/.mineru/models` | 模型文件根目录，默认取 `$MINERU_HOME/models` |
+| model | `model.source` | `auto` | 模型下载来源：`auto` / `huggingface` / `modelscope` / `local` |
+| model | `model.small_backend` | `auto` | 小模型后端：`auto` / `onnx` / `torch`；依据依赖与设备自动选择 |
+| model | `model.vlm.engine` | `auto` | 本地 VLM：`auto` / `llama-cpp` / `vllm` / `lmdeploy` / `mlx`；远程地址优先，MLX 仅显式使用 |
+| sqlite | `doclib.sqlite.path` | `~/.mineru/doclib.db` | SQLite DB 路径 |
+| sqlite | `doclib.sqlite.busy_timeout_ms` | `5000` | SQLite 锁等待时间（毫秒） |
+| sqlite | `doclib.sqlite.lock_retry_attempts` | `3` | `SQLITE_BUSY` / `SQLITE_LOCKED` 的额外重试次数 |
+| sqlite | `doclib.sqlite.lock_retry_base_delay_ms` | `50` | SQLite 锁重试的指数退避初始延迟（毫秒） |
+| sqlite | `doclib.sqlite.mmap_size` | `268435456` | mmap size |
+| sqlite | `doclib.sqlite.cache_size` | `-20000` | SQLite cache size |
+| sqlite | `doclib.sqlite.wal_autocheckpoint` | `1000` | WAL checkpoint 阈值 |
+| sqlite | `doclib.sqlite.journal_size_limit` | `33554432` | WAL journal size limit |
+| sqlite | `doclib.sqlite.temp_store` | `memory` | temp store |
+| sqlite | `doclib.sqlite.synchronous` | `NORMAL` | synchronous pragma |
+
+`doclib.uds.enabled` 和 `doclib.tcp.enabled` 是 `auto | true | false` 配置项。默认值为 `auto`。当前第一版只在启动前解析 `auto`: UDS 可用则启用 UDS、关闭 TCP；UDS 不可用则关闭 UDS、启用 TCP loopback。用户显式配置 `true` / `false` 时，server 尊重该配置。
+
+这些配置影响 doclib 如何启动，因此不能依赖 `mineru config` 读取。
+
+### 2.2 运行时配置
+
+运行时配置在 doclib server 启动后可读写。
+
+| 来源 | 例子 | 存储 | 说明 |
+|------|------|------|------|
+| SQLite `config` 表 | `parse_server.local.mode`、`parse_server.remote.url` | KV | doclib 运行时配置 |
+| `watches` 表 | watch 目录、可插拔设备状态 | 表结构 | 文件发现配置 |
+| `exclude_rules` 表 | exclude | 表结构 | 路径排除规则 |
+| `parsing_rules` 表 | parsing-rules | 表结构 | 路径解析规则 |
+| 当前命令显式参数 | `--tier standard`、`--remote` | 不持久化 | 当前请求覆盖 |
+| 环境变量 | `MINERU_API_KEY` | 不持久化 | 临时凭证或 CI 覆盖 |
+| SDK client 参数 | `base_url`、`api_key` | 调用方决定 | 当前 client 实例 |
+
+## 3. 优先级
+
+运行时行为的优先级从高到低。API Key 等运行时凭证的优先级见“API Key 与环境变量”。
+
+1. 当前命令显式参数。
+2. 当前进程环境变量。
+3. 启动前文件配置或 SQLite 配置。
+4. 内置默认值。
+
+启动前文件配置和 SQLite 配置不应定义同一配置项。需要在 doclib server 启动前确定的配置使用文件配置；doclib server 启动后可读写的配置使用 SQLite。设计上不允许同一项配置同时存在于文件和 DB，因此二者之间不应产生优先级冲突。
+
+SDK client 显式参数属于当前调用方传入的请求上下文；当它最终转化为 CLI/API 请求时，按“当前命令显式参数”处理。
+
+如果一个配置会改变隐私边界，例如启用远端上传，必须要求当前请求或规则显式允许，不能只因为全局配置存在 remote URL 或 API Key 就上传文档。
+
+启动前配置只用于必须在 doclib 初始化前确定的字段，比如 UDS/TCP transport、endpoint discovery 路径、DB 路径、SQLite pragma。它不与 SQLite 配置定义同一 key，也不在 doclib 启动后被 SQLite 覆盖。`MINERU_HOME` 属于 bootstrap 层，负责默认 home 与默认配置文件位置；`doclib.data_dir` 是独立配置项，默认取 `$MINERU_HOME/doclib`。
+
+## 4. 运行时 KV 配置
+
+运行时 KV 配置的默认值由代码定义，SQLite `config` 表只保存用户 override。
+
+| key | 默认值 | 说明 |
+|-----|--------|------|
+| `parse_server.local.mode` | `disabled` | 本地 parse-server 模式 |
+| `parse_server.local.managed_tier` | `standard` | managed 模式启动能力上限，接受 `basic`、`standard`、`advanced`，包含自身及较低档位；Advanced 复用 Standard 模型配置 |
+| `parse_server.remote.url` | `https://mineru.net/api` | 默认远端 API 地址 |
+
+## 5. Parse-server 配置
+
+parse-server 是 `basic` / `standard` / `advanced` 等质量 tier 的解析能力来源。它可以是本地独立进程，也可以是远端 `mineru.net/api`。
+
+### 5.1 Local parse-server
+
+| key | 默认值 | 说明 |
+|-----|--------|------|
+| `parse_server.local.mode` | `disabled` | `disabled` / `managed` / `self_hosted` |
+| `parse_server.local.managed_tier` | `standard` | managed 模式启动的 tier |
+| `parse_server.local.self_hosted_url` | 无 | self-hosted parse-server URL |
+| `parse_server.local.self_hosted_api_key` | 无 | self-hosted API Key，可选 |
+
+模式语义：
+
+| mode | 行为 |
+|------|------|
+| `disabled` | 不使用本地 parse-server；本地质量 tier 请求返回 `no_engine` 或相关错误 |
+| `managed` | doclib 启动和停止时自动管理 parse-server |
+| `self_hosted` | 用户自行启动 parse-server，doclib 只负责连接和探活 |
+
+### 5.2 Remote parse-server
+
+| key | 默认值 | 说明 |
+|-----|--------|------|
+| `parse_server.remote.url` | `https://mineru.net/api` | 默认远端 API 地址 |
+| `parse_server.remote.api_key` | 无 | 远端 API Key |
+
+远端配置存在不等于允许上传。只有当前请求显式 `--remote`，或 parsing-rule 显式带 remote 语义时，才可以上传文档。
+
+## 6. API Key 与环境变量
+
+API Key 读取优先级：
+
+1. Remote API 使用 SQLite config 中的 `parse_server.remote.api_key`。
+2. 未配置 Remote API Key 时，回退到环境变量 `MINERU_API_KEY`。
+
+`parse_server.local.self_hosted_api_key` 只读取自身的 SQLite config，不回退到 Remote API 的环境变量。
+
+环境变量适合无 tty 场景和 CI 的默认凭证，但运行中的 doclib server 会优先使用 `mineru config set`
+写入的运行时配置。环境变量不应改变是否允许 remote 上传的判断。
+
+建议保留的环境变量：
+
+| 变量 | 说明 |
+|------|------|
+| `MINERU_API_KEY` | 默认远端 API Key |
+| `MINERU_BASE_URL` | SDK 或 CLI 的默认远端 URL，是否采用待定 |
+| `MINERU_TELEMETRY_DISABLED` | Doclib 服务启动前的遥测禁用开关，优先于持久化偏好 |
+
+## 7. CLI 参数与配置关系
+
+`mineru parse` 的显式参数只影响当前请求：
+
+| CLI 参数 | 配置关系 |
+|----------|----------|
+| `--tier` | 覆盖当前请求 tier；未指定时使用默认选择策略 |
+| `--remote` | 显式允许当前请求上传远端；远端 URL 来自 config，API Key 优先来自 config，未配置时使用环境变量 |
+| `--pages` | 当前请求页码范围 |
+| `--force` | 当前请求跳过 done 缓存；复用 active parse 或为未覆盖页创建新 parse；不删除或作废旧缓存 |
+| `--wait` / `--no-wait` | 当前请求等待策略 |
+
+`mineru config` 修改持久配置：
+
+```bash
+mineru config set parse_server.local.mode managed
+mineru config set parse_server.local.managed_tier basic
+mineru config set parse_server.remote.api_key sk-...
+```
+
+当前已实现的 config 命令分组：
+
+| 命令 | 作用 |
+|------|------|
+| `mineru config show` | 展示 KV 配置、watch 和 rules |
+| `mineru watch add/list/remove/rescan` | 管理 watch 目录 |
+| `mineru config exclude add/list/rm` | 管理排除规则 |
+| `mineru config parsing-rules add/list/rm` | 管理解析规则 |
+| `mineru config set parse_server.local.mode` | 设置本地 parse-server 模式 |
+| `mineru config set parse_server.local.managed_tier` | 设置 managed tier |
+| `mineru config set parse_server.local.self_hosted_url` | 设置 self-hosted URL |
+| `mineru config set parse_server.local.self_hosted_api_key` | 设置 self-hosted API Key |
+| `mineru config set parse_server.remote.url` | 设置远端 URL |
+| `mineru config set parse_server.remote.api_key` | 设置远端 API Key |
+
+## 8. Watch 与 Rules
+
+Watch 目录、parsing-rules 和 exclude 规则不直接存储在 `config` KV 中，但属于配置体系。
+
+### 8.1 Watch
+
+Watch 用于自动发现文件和建立搜索索引。
+
+约束：
+
+- watch 默认 tier 是 `flash`。
+- watch 默认 tier 暂不配置化。
+- watch 的目标是发现、预览和索引，不是最终阅读质量。
+- watch 目录不允许嵌套。
+- removable watch 路径不可达时，应标记 `unreachable`，不永久删除记录。
+
+### 8.2 Parsing-rules
+
+Parsing-rules 通过路径 glob 指定自动解析策略。
+
+```bash
+mineru config parsing-rules add "*/论文/*" --tier basic --pages all
+mineru config parsing-rules add "*/合同/*" --tier standard --remote
+```
+
+约束：
+
+- 对 PDF/image，规则必须显式指定 remote，才允许上传远端。
+- 对 PDF/image，规则命中的 tier 必须经过能力检查。
+- 对 PDF/image，规则未指定 tier 时按 `standard` -> `basic` -> `flash` 选择，并只记录实际使用的实体 tier。
+- 对 OFD/EPUB/Office/HTML/MHTML/CSV/TSV，parsing-rule 的 tier、page_range 和 remote 不生效，实际按 `flash` 整本解析并记录；其它 text 只入库和索引，不创建 parse row。
+- 完整归一规则见 [ADR-0024](decisions/0024-file-type-tier-normalization.md)。
+
+### 8.3 Exclude
+
+Exclude 使用 glob 模式排除路径。默认 exclude 规则由 DB 初始化写入 `exclude_rules` 表，而不是写死在 config KV 中。
+
+默认规则覆盖：
+
+- `*/Library/*`
+- `*/.git/*`
+- `*/node_modules/*`
+- `*/vendor/*`
+- `*/go/pkg/*`
+- `*/__pycache__/*`
+- `*/.venv/*`
+- `*/miniconda3/*`
+- `*/.nvm/*`
+- `*/.docker/*`
+- `*/target/*`
+- `*/dist/*`
+- `*/build/*`
+
+## 9. SDK Client 配置
+
+`MinerUApiParser` 的构造参数为 `api_url/api_key/tier/ocr_mode/include_images`。
+api_url 未传时依次读取 `MINERU_API_URL` 和内置默认地址；api_key 未传时读取 `MINERU_API_KEY`。
+显式空字符串会清空认证，不再继承环境变量。tier=None 与 ocr_mode=None 在 HTTP 请求中省略。
+它没有 `default_tier/allow_remote` 构造参数；目标地址由调用者选择，Doclib 的 remote 授权另行处理。
+详见 [API-backed SDK](sdk/api-parser.md)。
+
+`DoclibClient` 使用独立的 endpoint_path/socket_path/base_url/timeout/api_prefix，见 [Doclib SDK](sdk/doclib-client.md)。
+这些构造参数不能互换，也不是 YAML 的同名配置段。
+
+## 10. 隐私与遥测
+
+隐私配置和遥测配置必须分开。
+
+文档隐私：
+
+- 默认 local。
+- 远端上传必须由当前请求或规则显式允许。
+- API Key 存在不代表允许上传。
+
+遥测：
+
+- 不包含文档内容、文件名和路径。
+- doclib server 是 P0 唯一 telemetry 上报主体。
+- 初始设置为 enabled；disable 后保存关闭选择，升级和重启保持。启动环境中的 `MINERU_TELEMETRY_DISABLED=1` 优先禁用，不改写持久化偏好；具体行为见遥测说明。
+- parser SDK、`mineru-kit parse`、`mineru-kit api-server` 等纯工具无 telemetry 能力。
+- telemetry 配置存储在 SQLite 中，不使用启动前文件配置。
+- telemetry 聚合数据也存储在 SQLite 中，flush 成功后删除已确认上报的数据。
+
+遥测字段、开关、默认值、隐私边界和上报时机以 [Telemetry 最小规范](telemetry-minimum.md) 为准；旧设计仅作历史背景。
+
+## 与其他文档的关系
+
+- CLI 参数见 [CLI 规格](cli/README.md)。
+- CLI 配置命令见 [mineru library](cli/mineru-library.md)。
+- 启动前 server 配置和 SQLite `config` 表见 [系统架构](architecture.md)。
+- API key、base_url、timeout 等 client 配置见 [SDK 设计](sdk/README.md)。
+- 隐私默认策略见本页「隐私与遥测」，后续决策见 [当前待办](backlog.md)。
+- Tier 默认语义见 [解析 Tier](tiers.md)。
+- 配置相关错误见 [错误码体系](errors.md)。
+
+## 未决问题
+
+项目级配置、用户级配置路径和正式环境变量等问题，集中维护在 [开放问题清单](backlog.md)。

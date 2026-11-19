@@ -1,0 +1,1468 @@
+"""MinerU Kit 的 V1 Gradio 应用组装与启动入口。"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import os
+import uuid
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import quote
+
+from ...filetypes import (
+    FLASH_ONLY_PARSE_EXTENSIONS,
+    HTML_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    MHTML_EXTENSIONS,
+    OFFICE_EXTENSIONS,
+    PARSEABLE_EXTENSIONS,
+    PDF_EXTENSIONS,
+)
+from ...types import TIERS, ServerStartupTier, Tier, select_default_task_tier
+from ...utils.logger import configure_global_log_level
+from ...utils.stdio import configure_standard_streams
+from .artifacts import RunArtifacts, render_download
+from .client import (
+    GradioArtifactClient,
+    ManagedLocalApiServer,
+    V1ArtifactClient,
+    V1ServerCapabilities,
+)
+from .conversion import ConversionInput, SessionConversions, await_task_completion
+from .conversion_service import ConversionService, ParseClient
+from .conversion_ui import build_conversion_receipt, conversion_updates, download_updates
+from .document_io import GradioDocumentIO, LocalGradioDocumentIO
+from .epub_preview import register_epub_preview_resources
+from .i18n import MESSAGES, localized_text, preview_placeholder, translations
+from .lifecycle import with_setup_loop
+from .page_range import validate_max_pages
+from .pdf_preview import pdf_preview_js, register_pdf_preview_resources
+from .source_preview import prepare_source_preview
+from .status import (
+    DEFAULT_STATUS as _DEFAULT_STATUS,
+)
+from .status import (
+    STATUS_PREPARING_REQUEST,
+)
+from .status import (
+    status_html as _status_html,
+)
+
+_DOWNLOAD_FORMATS: tuple[tuple[str, str], ...] = (
+    ("markdown", "Markdown"),
+    ("json", "JSON"),
+    ("html", "HTML"),
+    ("docx", "DOCX"),
+    ("latex", "LaTeX"),
+    ("epub", "EPUB"),
+    ("pdf", "PDF"),
+)
+# 下载图标采用统一线宽：Markdown 标记、JSON 花括号、HTML 标签、文档、公式、书籍和 PDF 文件。
+_DOWNLOAD_ICON_PATHS: dict[str, str] = {
+    "markdown": "M3 17V7l4 5 4-5v10M15 13l3 4 3-4M18 7v10",
+    "json": "M9 4H7a2 2 0 0 0-2 2v3a3 3 0 0 1-2 3 3 3 0 0 1 2 3v3a2 2 0 0 0 2 2h2"
+    "M15 4h2a2 2 0 0 1 2 2v3a3 3 0 0 0 2 3 3 3 0 0 0-2 3v3a2 2 0 0 1-2 2h-2",
+    "html": "M7 7l-5 5 5 5M17 7l5 5-5 5M14 4l-4 16",
+    "docx": "M14 3H5v18h14V8l-5-5v5h5M8 12h8M8 16h8",
+    "latex": "M19 5H5l8 7-8 7h14M19 5v3M19 16v3",
+    "epub": "M12 6c-3-2-6-2-10-2v15c4 0 7 0 10 2 3-2 6-2 10-2V4c-4 0-7 0-10 2v15",
+    "pdf": "M14 3H5v18h14V8l-5-5v5h5M8 17c3-4 5-8 4-8-2 0-1 7 4 7 3 0-5-3-8 1-1 2 1 1 2 0",
+}
+_DOWNLOAD_ICON_HTML = f"""
+<button type="button" class="mineru-kit-download-icon" title="Download results" aria-label="Download results"
+        data-mineru-i18n-key="download_results" data-mineru-i18n-attr="title aria-label"
+        aria-controls="mineru-kit-download-options">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4" />
+    </svg>
+    {localized_text("download")}
+</button>
+"""
+_KIT_MENU_CSS = """
+.mineru-kit-results {
+    --mineru-download-trigger-width: 108px;
+    position: relative; padding: 12px !important; overflow: visible;
+    /* 保留原输出栏总高度，将空提示区释放的空间交给正文。 */
+    min-height: calc(var(--mineru-preview-content-height) + 110px);
+}
+.mineru-kit-results > .mineru-markdown-tabs { display: flex !important; flex-direction: column; gap: 16px; }
+.mineru-kit-results [role="tabpanel"] { margin-top: 0 !important; }
+.mineru-kit-results > .mineru-markdown-tabs,
+.mineru-kit-results [role="tabpanel"],
+.mineru-kit-results [role="tabpanel"] > .column { flex: 1 1 0; min-height: 0; }
+.mineru-kit-results .mineru-markdown-output { flex: 1 1 0; height: 100%; min-height: 0 !important; }
+.mineru-kit-results .mineru-markdown-output .html-container,
+.mineru-kit-results .mineru-markdown-output .prose { height: 100%; }
+.mineru-kit-results .mineru-rendered-html-frame { height: 100% !important; }
+.mineru-kit-results .mineru-structured-json { flex: 1 1 0; height: 100%; min-height: 0 !important; }
+.mineru-structured-json .code-container,
+.mineru-structured-json .cm-editor { height: 100% !important; min-height: 0 !important; max-height: none !important; }
+.mineru-structured-json .cm-scroller { overflow: auto; }
+.mineru-kit-download-notice:not(:has([role="alert"])) { display: none !important; }
+/* 只缩窄 Gradio 6 的标题行，让正文继续占满结果栏。 */
+.mineru-kit-results > .mineru-markdown-tabs > .tab-wrapper {
+    width: calc(100% - var(--mineru-download-trigger-width) - 8px);
+    margin-bottom: 0 !important;
+}
+.mineru-kit-results > .mineru-kit-download-menu {
+    position: absolute; top: 12px; right: 12px; z-index: 40;
+    width: var(--mineru-download-trigger-width) !important; min-width: 0 !important; height: 32px; gap: 0;
+    overflow: visible;
+}
+.mineru-kit-download-trigger,
+.mineru-kit-download-trigger .html-container,
+.mineru-kit-download-trigger .prose {
+    min-width: 0 !important; padding: 0 !important; margin: 0; line-height: 0 !important; overflow: visible;
+}
+.mineru-kit-download-trigger { min-height: 32px; border: 0; background: transparent; }
+/* Gradio 主题对 .gradio-style button 的原生按钮样式优先级更高（HF Space 上
+   无前缀改写时），此处声明须带 !important 才能稳定生效；hover 变色同理。 */
+.mineru-kit-download-trigger .mineru-kit-download-icon {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100% !important; height: 32px !important; margin: 0; padding: 6px 8px !important;
+    border: 0; border-radius: 6px;
+    font-size: 14px !important; line-height: 20px; white-space: nowrap;
+    color: var(--body-text-color, #1f2937) !important; background: transparent !important; cursor: pointer;
+}
+.mineru-kit-download-icon svg { width: 20px; height: 20px; margin: 0; flex: 0 0 20px; }
+.mineru-kit-download-menu:hover .mineru-kit-download-icon,
+.mineru-kit-download-icon:focus-visible { background: var(--background-fill-secondary, #f3f4f6) !important; }
+.mineru-kit-download-icon:focus-visible { outline: 2px solid var(--mineru-accent, #f97316); outline-offset: 2px; }
+/* Gradio 会在页面端给自定义 CSS 加 .gradio-container-<ver> .contain 前缀抬升
+   优先级，但该改写在部分环境（如 HF Space 实测）不会执行，此时类选择器
+   (0,1,0) 会输给 Column 自带的 div.svelte-siXXXX { position: relative }
+   scoped 规则 (0,1,1)，浮窗被顶开 38px 并使 hover 桥失效。
+   组件已带 elem_id，用 ID 选择器不依赖该改写，在所有环境稳赢；
+   hover/focus 显示规则须同步用 ID，否则压不过基础规则 (1,0,0)。 */
+#mineru-kit-download-options {
+    position: absolute; right: 0; top: calc(100% + 6px); z-index: 40;
+    width: max-content !important; min-width: 0 !important;
+    display: flex !important; flex-direction: column; gap: 4px; padding: 6px;
+    border: 1px solid var(--mineru-panel-border, rgba(17,24,39,.12)); border-radius: 8px;
+    background: var(--background-fill-primary, #fff); box-shadow: 0 12px 28px rgba(15,23,42,.18);
+    opacity: 0; pointer-events: none; transform: translateY(-4px); visibility: hidden;
+    transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+}
+.mineru-kit-download-menu:hover #mineru-kit-download-options,
+.mineru-kit-download-menu:focus-within #mineru-kit-download-options {
+    opacity: 1; pointer-events: auto; transform: translateY(0); visibility: visible;
+}
+/* 填满图标与浮层之间的间隙，避免鼠标移向下载项时菜单提前关闭。 */
+.mineru-kit-download-options::before { content: ""; position: absolute; left: 0; right: 0; top: -7px; height: 7px; }
+#mineru-kit-download-options :is(button, a) {
+    justify-content: flex-start; width: 100%; min-height: 34px; padding: 6px 10px; white-space: nowrap;
+    border: 0; border-radius: 6px; background: transparent; box-shadow: none; text-align: left; gap: 8px;
+}
+.mineru-kit-download-options button::before {
+    content: ""; display: block; width: 16px; height: 16px; flex: 0 0 16px;
+    background-color: currentColor;
+    -webkit-mask: var(--mineru-download-format-icon) center / contain no-repeat;
+    mask: var(--mineru-download-format-icon) center / contain no-repeat;
+}
+#mineru-kit-download-options :is(button, a):hover { background: var(--background-fill-secondary, #f3f4f6); }
+.mineru-kit-empty-preview { min-height: 160px; display: grid; place-items: center; opacity: .65; }
+/* Gradio 6.x 仍按逗号拆分并重写选择器，PDF/源文档预览使用独立选择器避免破坏 :has。 */
+/* PDF/源文档预览直接贴合面板边框，独立预览不再沿用旧组件的标签留白与额外高度。 */
+.mineru-kit-preview:has(.mineru-pdf-frame),
+.mineru-kit-preview:has(.mineru-source-frame),
+.mineru-kit-preview:has(.mineru-epub-frame) {
+    padding: 0; gap: 0; overflow: hidden;
+    min-height: var(--mineru-preview-content-height, 775px) !important;
+}
+.mineru-kit-preview > .block.mineru-kit-pdf-preview,
+.mineru-kit-preview > .block.mineru-kit-source-preview {
+    height: var(--mineru-preview-content-height, 775px) !important;
+    min-height: 0 !important; max-height: none !important;
+}
+.mineru-kit-pdf-preview, .mineru-kit-source-preview { height: 100%; padding: 0 !important; }
+.mineru-kit-source-preview:has(.mineru-epub-frame) {
+    height: var(--mineru-preview-content-height, 775px) !important;
+    min-height: var(--mineru-preview-content-height, 775px) !important;
+}
+.mineru-kit-pdf-preview .html-container, .mineru-kit-pdf-preview .prose,
+.mineru-kit-source-preview .html-container, .mineru-kit-source-preview .prose { height: 100%; padding: 0 !important; }
+.mineru-kit-pdf-preview:not(:has(.mineru-pdf-frame, [role="alert"], [role="status"])) { display: none !important; }
+/* HTML 源预览用固定 viewport 裁剪逻辑舞台。缩放舞台而不是 iframe 本体，
+   避免 Safari/WebKit 在 transform iframe 时把子文档绘制层裁成局部区域。 */
+.mineru-source-viewport {
+    position: relative; display: block; width: 100%; height: 100%; min-height: 0; overflow: hidden;
+}
+.mineru-source-stage {
+    display: block; width: 100%; height: 100%; min-height: 0; transform-origin: 0 0;
+}
+.mineru-pdf-frame, .mineru-source-frame, .mineru-epub-frame {
+    display: block; width: 100%; height: 100%; min-height: 0; border: 0;
+}
+.mineru-kit-source-preview:not(:has(iframe)):not(:has([data-mineru-i18n-key])) { display: none !important; }
+.mineru-kit-image-preview img { max-height: var(--mineru-pdf-page-height, 720px); object-fit: contain; }
+/* 桌面两栏共用行高，PDF/源文档预览填满伸展后的面板；窄屏仍采用独立预览高度。 */
+@media (min-width: 901px) {
+  .mineru-kit-results, .mineru-kit-preview:has(.mineru-pdf-frame),
+  .mineru-kit-preview:has(.mineru-source-frame),
+  .mineru-kit-preview:has(.mineru-epub-frame) {
+    align-self: stretch !important;
+    height: auto;
+  }
+  .mineru-kit-preview > .block.mineru-kit-pdf-preview,
+  .mineru-kit-preview > .block.mineru-kit-source-preview {
+    flex: 1 1 0;
+    height: auto !important;
+  }
+  /* 结果栏变高时，EPUB iframe 也必须沿着完整的 Gradio 高度链拉伸，
+     否则固定的默认预览高度下方会露出父容器背景。 */
+  .mineru-kit-workspace:has(.mineru-epub-frame) {
+    align-items: stretch !important;
+  }
+  .mineru-kit-preview:has(.mineru-epub-frame) {
+    height: auto !important;
+    min-height: var(--mineru-preview-content-height, 775px) !important;
+    background: #fff !important;
+  }
+  .mineru-kit-preview:has(.mineru-epub-frame) > .block.mineru-kit-source-preview,
+  .mineru-kit-preview:has(.mineru-epub-frame) .mineru-kit-source-preview,
+  .mineru-kit-preview:has(.mineru-epub-frame) .html-container,
+  .mineru-kit-preview:has(.mineru-epub-frame) .prose,
+  .mineru-kit-preview:has(.mineru-epub-frame) .mineru-epub-frame {
+    height: 100% !important;
+    min-height: 0 !important;
+  }
+}
+@media (max-width: 900px) {
+  .mineru-kit-workspace { flex-direction: column !important; }
+  .mineru-kit-control, .mineru-kit-preview, .mineru-kit-results { min-width: 0 !important; width: 100% !important; }
+  /* 窄屏改用固定高度、整栏按内容收口：不依赖上面的 flex 拉伸链（移动端引擎
+     可能不把拉伸所得高度视为定值，height:100% 断链时 iframe 会塌到默认
+     ~150px），也避免拉伸模式下 885px min-height 与 775px 正文之间在卡片
+     底部留下死区。与 PDF/源文档预览的窄屏策略一致。 */
+  .mineru-kit-results { min-height: 0; flex: 0 0 auto !important; }
+  .mineru-kit-results > .mineru-markdown-tabs,
+  .mineru-kit-results [role="tabpanel"],
+  .mineru-kit-results [role="tabpanel"] > .column { flex: 0 0 auto; }
+  .mineru-kit-results .mineru-markdown-output,
+  .mineru-kit-results .mineru-structured-json {
+    flex: 0 0 auto !important;
+    height: var(--mineru-preview-content-height, 775px) !important;
+    min-height: var(--mineru-preview-content-height, 775px) !important;
+  }
+}
+"""
+
+
+def _resource_text(resource_name: str) -> str:
+    """从已安装 MinerU 包资源中读取 Gradio 静态文本。"""
+    resource_path = Path(__file__).resolve().parents[2] / "resources" / resource_name
+    return resource_path.read_text(encoding="utf-8")
+
+
+def _render_upload(file_types: list[str]) -> str:
+    """渲染动作图标空状态和紧凑文件条，双语标记只作用于文字叶节点。"""
+    template = _resource_text("gradio_upload.html")
+    template = template.replace("{{ACCEPT}}", html.escape(",".join(file_types), quote=True))
+    template = template.replace("{{UPLOAD_LABEL}}", html.escape(MESSAGES["upload_drop"][1], quote=True))
+    for key in ("upload_choose", "upload_drag", "upload_paste", "upload_document", "upload_image", "upload_or"):
+        template = template.replace("{{" + key.upper() + "}}", localized_text(key))
+    return template
+
+
+def _download_icon_css() -> str:
+    """为各下载格式生成本地 SVG 遮罩，随按钮文字适配主题且不改变无障碍名称。"""
+    rules = []
+    for format_name, path in _DOWNLOAD_ICON_PATHS.items():
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+            f'stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="{path}"/></svg>'
+        )
+        rules.append(
+            f'.mineru-kit-download-{format_name} {{ --mineru-download-format-icon: url("data:image/svg+xml,{quote(svg)}"); }}'
+        )
+    return "\n".join(rules)
+
+
+def _render_header() -> str:
+    """渲染响应式按钮与统一资源菜单的 Header。"""
+    template = _resource_text("gradio_header.html")
+    values = {
+        "{{HEADER_MODEL_HUGGINGFACE_LINK}}": "Hugging Face",
+        "{{HEADER_MODEL_MODELSCOPE_LINK}}": "ModelScope",
+        "{{HEADER_PAPER_MINERU_REPORT}}": "MinerU",
+        "{{HEADER_PAPER_MINERU25_REPORT}}": "MinerU 2.5",
+        "{{HEADER_PAPER_MINERU25PRO_REPORT}}": "MinerU 2.5 Pro",
+    }
+    for placeholder, key in {
+        "HEADER_TITLE": "header_title",
+        "HEADER_SUBTITLE": "header_subtitle",
+        "HEADER_SUPPORT_TEXT": "header_support_text",
+        "HEADER_CODE_LINK": "code",
+        "HEADER_MODEL_LINK": "model",
+        "HEADER_PAPER_LINK": "paper",
+        "HEADER_HOMEPAGE_LINK": "homepage",
+    }.items():
+        template = template.replace("{{" + placeholder + "}}", localized_text(key))
+    template = template.replace(
+        'alt="{{HEADER_STARS_ALT}}"', 'alt="GitHub stars" data-mineru-i18n-attr="alt" data-mineru-i18n-key="stars"'
+    )
+    rendered = template
+    for placeholder, value in values.items():
+        rendered = rendered.replace(placeholder, html.escape(value, quote=True))
+    return rendered
+
+
+def _supported_file_types() -> list[str]:
+    """把统一 filetypes 集合转换为 Gradio 文件选择器后缀。"""
+    return [f".{extension}" for extension in sorted(PARSEABLE_EXTENSIONS)]
+
+
+def _default_tier(capabilities: V1ServerCapabilities) -> Tier:
+    """根据服务能力复用 Tasks 默认选档，空能力集合无法构建解析界面。"""
+    tier = select_default_task_tier(capabilities.tiers)
+    if tier is None:
+        raise ValueError("V1 API server did not advertise any parsing tier")
+    return tier
+
+
+def _file_suffix(path_value: str | Path | None) -> str:
+    """读取上传文件的小写后缀，供预览、选页与 OCR 控件判断。"""
+    if not path_value:
+        return ""
+    return Path(path_value).suffix.lower().lstrip(".")
+
+
+def _is_pdf_or_image(path_value: str | Path | None) -> bool:
+    """判断上传文件是否可以在 PDF 预览组件中展示。"""
+    suffix = _file_suffix(path_value)
+    return suffix in PDF_EXTENSIONS or suffix in IMAGE_EXTENSIONS
+
+
+def _is_office(path_value: str | Path | None) -> bool:
+    """判断上传文件是否适合展示 Office 在线预览提示。"""
+    return _file_suffix(path_value) in OFFICE_EXTENSIONS
+
+
+def _preview_update(gr: Any, value: object, *, visible: bool) -> Any:
+    """构造原生组件的内容与显隐更新。"""
+    return gr.update(value=value, visible=visible)
+
+
+def _pdf_preview_update(gr: Any, value: str | None) -> Any:
+    """保持文件输出的 FileData 契约，实际预览由独立 HTML 组件承载。"""
+    return gr.update(value=value, visible=False)
+
+
+@with_setup_loop
+def build_gradio_app(
+    client: ParseClient,
+    capabilities: V1ServerCapabilities,
+    *,
+    output_root: Path,
+    enable_example: bool = True,
+    enable_api: bool = True,
+    max_pages: int | None = None,
+    document_io: GradioDocumentIO | None = None,
+    runtime_device_loader: Callable[[], Awaitable[Literal["cpu", "gpu"] | None]] | None = None,
+) -> Any:
+    """构建不启动监听端口的 Gradio Blocks 应用，便于单元测试和外部托管。"""
+    import gradio as gr
+
+    viewer_entry = register_pdf_preview_resources()
+    epub_viewer_entry = register_epub_preview_resources()
+    validate_max_pages(max_pages)
+    document_io = document_io if document_io is not None else LocalGradioDocumentIO()
+    tier_choices = [tier for tier in TIERS if tier in capabilities.tiers]
+    if not tier_choices:
+        raise ValueError("V1 API server did not advertise any parsing tier")
+    preferred_tier = _default_tier(capabilities)
+    file_types = _supported_file_types()
+
+    async def read_runtime_device(_data: object) -> Literal["cpu", "gpu"] | None:
+        """供每个页面的胶囊挂载时读取一次设备状态，不参与档位或解析状态更新。"""
+        return await runtime_device_loader() if runtime_device_loader is not None else None
+
+    def upload_context(_data: object, request: object | None = None) -> dict[str, str]:
+        """为可取消的进度上传提供原生 Gradio 地址，沿用请求鉴权和反向代理挂载前缀。"""
+        # Gradio 的组件服务函数传入原始 Starlette Request，普通事件则使用 gr.Request 包装。
+        if request is not None and not isinstance(request, gr.Request):
+            request = gr.Request(request=request)
+        base_url = _gradio_public_base_url(request)
+        return {"upload_url": f"{base_url}/gradio_api/upload", "file_url_prefix": f"{base_url}/gradio_api/file="}
+
+    upload_context.__annotations__["request"] = gr.Request
+    examples = _example_files(file_types) if enable_example else []
+    app_css = _resource_text("gradio_app.css") + _resource_text("gradio_tier.css") + _KIT_MENU_CSS + _download_icon_css()
+    i18n = gr.I18n(**translations())
+    app_js = (
+        _resource_text("gradio_app.js")
+        .replace(
+            "__MINERU_I18N__",
+            f"({_resource_text('gradio_i18n.js')})({json.dumps(MESSAGES, ensure_ascii=False)})",
+        )
+        .replace(
+            "__MINERU_STATUS_TIMER__",
+            _resource_text("gradio_status_timer.js"),
+        )
+    )
+    app_js = app_js.replace("__MINERU_TRACE__", _resource_text("gradio_trace.js"))
+    app_js = app_js.replace("__MINERU_PDF_PREVIEW__", _resource_text("gradio_pdf_preview.js"))
+    # 等待限制放在生成器内部，使其他会话也能立即显示本地排队状态。
+    conversions = SessionConversions()
+    conversion_service = ConversionService(
+        client,
+        tier_choices=tier_choices,
+        output_root=output_root,
+        max_pages=max_pages,
+        slot=conversions.slot,
+        document_io=document_io,
+    )
+
+    with gr.Blocks() as demo:
+        # Header 自行定义排版，避免 Gradio 的按钮字体与链接下划线覆盖设计。
+        gr.HTML(
+            _render_header(),
+            elem_classes=["mineru-header-html"],
+            js_on_load=f"({_resource_text('gradio_header.js')})({{element}})",
+            apply_default_css=False,
+        )
+        with gr.Row(elem_classes=["mineru-kit-workspace"]):
+            with gr.Column(scale=2, min_width=280, elem_classes=["mineru-kit-control", "mineru-control-column"]):
+                input_file = gr.File(
+                    label=i18n("mineru.upload"),
+                    file_types=file_types,
+                    file_count="single",
+                    type="filepath",
+                    visible=False,
+                )
+                upload_control = gr.HTML(
+                    value="",
+                    html_template=_render_upload(file_types),
+                    js_on_load="("
+                    + _resource_text("gradio_upload.js")
+                    + ")({element, props, server, accepted: "
+                    + json.dumps(file_types)
+                    + ", imageExtensions: "
+                    + json.dumps(sorted(IMAGE_EXTENSIONS))
+                    + "})",
+                    server_functions=[upload_context],
+                    elem_classes=["mineru-upload-file"],
+                )
+                tier_control = gr.HTML(
+                    value=tier_choices.index(preferred_tier),
+                    html_template=_resource_text("gradio_tier.html"),
+                    js_on_load=(
+                        f"({_resource_text('gradio_tier.js')})"
+                        f"({{element, props, trigger, watch, server, tiers: {json.dumps(tier_choices)}, "
+                        f"defaultIndex: {tier_choices.index(preferred_tier)}}})"
+                    ),
+                    server_functions=[read_runtime_device],
+                    selected_tier=preferred_tier,
+                    locked=False,
+                    apply_default_css=False,
+                    elem_classes=["mineru-tier-control"],
+                )
+                # 隐藏的原生数值组件保留公开转换 API 的整数档位协议。
+                tier = gr.Slider(
+                    minimum=0,
+                    maximum=max(1, len(tier_choices) - 1),
+                    value=tier_choices.index(preferred_tier),
+                    step=1,
+                    precision=0,
+                    interactive=len(tier_choices) > 1,
+                    visible=False,
+                    label=i18n("mineru.tier"),
+                    show_label=False,
+                    elem_classes=["mineru-tier-slider"],
+                )
+                # 独立保存会话的未锁定档位，不随文件和页码选区一起重置。
+                tier_selection = gr.Textbox(value=json.dumps({"tier": preferred_tier, "locked": False}), visible=False)
+                force_ocr = gr.Checkbox(
+                    value=False,
+                    label=i18n("mineru.force_ocr"),
+                    info=i18n("mineru.force_ocr_info"),
+                    visible=False,
+                    interactive=True,
+                    elem_classes=["mineru-force-ocr"],
+                )
+                page_range = gr.Textbox(
+                    value="",
+                    label=i18n("mineru.page_range"),
+                    visible=False,
+                )
+                # 用 JSON 文本承载前端状态，保持现有事件输入契约。
+                page_metadata = gr.Textbox(value="{}", visible=False)
+                page_selection = gr.Textbox(value="{}", visible=False)
+                # 摘要控制显隐，选页组件本地预览手势并在松手时原子提交两端。
+                with gr.Column(min_width=0, elem_classes=["mineru-kit-page-range"]):
+                    page_summary = gr.HTML(value="", elem_classes=["mineru-page-summary"])
+                    with gr.Row(elem_classes=["mineru-page-inputs"]):
+                        page_start = gr.Number(
+                            value=1,
+                            minimum=1,
+                            maximum=1,
+                            precision=0,
+                            label=i18n("mineru.start_page_short"),
+                            show_label=True,
+                            interactive=False,
+                            min_width=0,
+                            elem_classes=["mineru-page-number", "mineru-page-start"],
+                        )
+                        page_end = gr.Number(
+                            value=1,
+                            minimum=1,
+                            maximum=1,
+                            precision=0,
+                            label=i18n("mineru.end_page_short"),
+                            show_label=True,
+                            interactive=False,
+                            min_width=0,
+                            elem_classes=["mineru-page-number", "mineru-page-end"],
+                        )
+                        page_preset = gr.Button(
+                            i18n("mineru.page_all"),
+                            interactive=False,
+                            size="sm",
+                            scale=0,
+                            min_width=0,
+                            elem_classes=["mineru-page-preset"],
+                        )
+                    page_control = gr.HTML(
+                        value="{}",
+                        html_template=_resource_text("gradio_page_control.html"),
+                        js_on_load=(
+                            "("
+                            + _resource_text("gradio_page_control.js").replace(
+                                "__MINERU_PAGE_RANGE_MODEL__", _resource_text("gradio_page_range_model.js")
+                            )
+                            + f")({{element, props, trigger, watch, maxPages: {json.dumps(max_pages)}}})"
+                        ),
+                        apply_default_css=False,
+                        elem_classes=["mineru-page-control"],
+                    )
+                page_notice = gr.HTML(value="", visible=False, elem_classes=["mineru-page-notice"])
+                with gr.Row(elem_classes=["mineru-actions"]):
+                    convert_button = gr.Button(
+                        i18n("mineru.convert"),
+                        variant="primary",
+                        scale=1,
+                        min_width=0,
+                        interactive=False,
+                        elem_classes=["mineru-convert-button"],
+                    )
+                    clear_button = gr.ClearButton(value=i18n("mineru.clear"), scale=1, min_width=1, elem_id="mineru-kit-clear")
+                status_panel = gr.HTML(_status_html(), elem_classes=["mineru-status-panel"])
+                if examples:
+                    gr.Examples(
+                        examples=examples,
+                        inputs=input_file,
+                        label=i18n("mineru.examples"),
+                        elem_id="mineru-kit-examples",
+                        # 示例全部落在第一页，超出由卡片内部滚动；避免出现翻页控件。
+                        examples_per_page=_EXAMPLES_PER_PAGE,
+                    )
+
+            with gr.Column(scale=4, min_width=340, elem_classes=["mineru-kit-preview", "mineru-preview-pane"]):
+                pdf_preview = gr.File(visible=False, interactive=False, label="PDF", type="filepath")
+                pdf_viewer_entry = gr.File(value=str(viewer_entry), visible=False, interactive=False)
+                epub_viewer_entry_component = gr.File(value=str(epub_viewer_entry), visible=False, interactive=False)
+                pdf_viewer = gr.HTML(
+                    value='<div class="mineru-pdf-host"></div>',
+                    apply_default_css=False,
+                    # 保持原生 HTML 挂载，避免较早的 Gradio 6 忽略纯前端的 visible 更新。
+                    visible=True,
+                    elem_classes=["mineru-kit-pdf-preview"],
+                )
+                image_preview = gr.Image(
+                    label=i18n("mineru.preview"),
+                    type="filepath",
+                    interactive=False,
+                    visible=False,
+                    height=720,
+                    elem_classes=["mineru-kit-image-preview"],
+                )
+                office_preview = gr.HTML(
+                    value="",
+                    visible=False,
+                    min_height=320,
+                    elem_classes=["mineru-kit-office-preview", "mineru-office-preview-html"],
+                )
+                source_preview = gr.HTML(
+                    value="",
+                    apply_default_css=False,
+                    elem_classes=["mineru-kit-source-preview"],
+                )
+                source_ticket = gr.Textbox(value="", visible=False)
+                source_receipt = gr.Textbox(value="", visible=False)
+                generic_preview = gr.HTML(
+                    value=preview_placeholder("empty_preview"),
+                    visible=True,
+                    elem_classes=["mineru-kit-generic-preview"],
+                )
+
+            with gr.Column(scale=4, min_width=340, elem_classes=["mineru-kit-results", "mineru-markdown-pane"]):
+                with gr.Tabs(elem_classes=["mineru-markdown-tabs"]):
+                    with gr.Tab(i18n("mineru.markdown")):
+                        html_output = gr.HTML(
+                            value="",
+                            elem_classes=["mineru-markdown-output"],
+                        )
+                    with gr.Tab(i18n("mineru.json_view")):
+                        json_output = gr.Code(
+                            value="",
+                            language="json",
+                            interactive=False,
+                            show_label=False,
+                            container=False,
+                            lines=1,
+                            wrap_lines=True,
+                            buttons=["copy"],
+                            elem_classes=["mineru-structured-json"],
+                        )
+                with gr.Column(scale=0, min_width=0, elem_classes=["mineru-kit-download-menu"]):
+                    gr.HTML(_DOWNLOAD_ICON_HTML, elem_classes=["mineru-kit-download-trigger"])
+                    with gr.Column(
+                        min_width=0,
+                        elem_id="mineru-kit-download-options",
+                        elem_classes=["mineru-kit-download-options"],
+                    ):
+                        download_buttons: dict[str, Any] = {}
+                        for format_name, label in _DOWNLOAD_FORMATS:
+                            download_buttons[format_name] = gr.Button(
+                                label,
+                                visible=True,
+                                interactive=False,
+                                size="sm",
+                                min_width=0,
+                                elem_classes=[f"mineru-kit-download-{format_name}"],
+                            )
+                download_notice = gr.HTML(value="", elem_classes=["mineru-kit-download-notice"])
+
+        artifact_state = gr.State(value=None)
+        active_run_id = gr.Textbox(value="", visible=False)
+        conversion_ticket = gr.Textbox(value="", visible=False)
+        conversion_receipt = gr.Textbox(value="", visible=False)
+        conversion_cancel = gr.Textbox(value="", visible=False)
+        status_snapshot = gr.Textbox(value="", visible=False)
+        status_poll = gr.Timer(value=1.0, active=False)
+        api_conversion_button = gr.Button(visible=False)
+        download_files = {name: gr.File(visible=False, interactive=False) for name, _label in _DOWNLOAD_FORMATS}
+        download_requests = {name: gr.Textbox(value="", visible=False) for name, _label in _DOWNLOAD_FORMATS}
+        download_receipts = {name: gr.Textbox(value="", visible=False) for name, _label in _DOWNLOAD_FORMATS}
+        clear_button.add(
+            [
+                input_file,
+                page_range,
+                force_ocr,
+                html_output,
+                json_output,
+                pdf_preview,
+                image_preview,
+                office_preview,
+                generic_preview,
+                status_panel,
+            ]
+        )
+
+        preview_identities: dict[str, tuple[str | None, str]] = {}
+
+        def update_file_preview(file_path: str | None, request: object | None = None, ticket: str = "") -> tuple[Any, ...]:
+            """真实选择变更才清除结果；重复 FileData 事件及迟到源回执保持当前结果。"""
+            session = getattr(request, "session_hash", "") or ""
+            identity = json.loads(ticket or "{}")
+            if session:
+                revision = identity.get("revision", 0)
+                selected = (file_path, identity.get("id", ""))
+                if (
+                    ticket and identity.get("path") != (file_path or "")
+                ) or revision < conversion_service.sources.revisions.get(session, 0):
+                    return tuple(gr.skip() for _ in preview_outputs)
+                if preview_identities.get(session) == selected:
+                    return tuple(gr.skip() for _ in preview_outputs)
+                preview_identities[session] = selected
+            reset_result = (
+                _status_html(_DEFAULT_STATUS),
+                "",
+                None,
+                *download_updates(_DOWNLOAD_FORMATS, interactive=False),
+                "",
+            )
+            if not file_path:
+                return (
+                    _pdf_preview_update(gr, None),
+                    _preview_update(gr, None, visible=False),
+                    _preview_update(gr, "", visible=False),
+                    _preview_update(gr, preview_placeholder("empty_preview"), visible=True),
+                    *reset_result,
+                )
+            suffix = _file_suffix(file_path)
+            if suffix in PDF_EXTENSIONS:
+                return (
+                    _pdf_preview_update(gr, file_path),
+                    _preview_update(gr, None, visible=False),
+                    _preview_update(gr, "", visible=False),
+                    _preview_update(gr, preview_placeholder("source_preview"), visible=False),
+                    *reset_result,
+                )
+            if suffix in IMAGE_EXTENSIONS:
+                return (
+                    _pdf_preview_update(gr, None),
+                    _preview_update(gr, None, visible=False),
+                    _preview_update(gr, "", visible=False),
+                    _preview_update(gr, preview_placeholder("source_preview"), visible=False),
+                    *reset_result,
+                )
+            if suffix in {"ofd", "epub"} or suffix in HTML_EXTENSIONS | MHTML_EXTENSIONS:
+                # OFD/EPUB/HTML 源预览由独立异步事件挂载，此处只隐藏占位组件。
+                return (
+                    _pdf_preview_update(gr, None),
+                    _preview_update(gr, None, visible=False),
+                    _preview_update(gr, "", visible=False),
+                    _preview_update(gr, "", visible=False),
+                    *reset_result,
+                )
+            if _is_office(file_path):
+                return (
+                    _pdf_preview_update(gr, None),
+                    _preview_update(gr, None, visible=False),
+                    _preview_update(
+                        gr,
+                        _build_office_preview_html(file_path, request),
+                        visible=True,
+                    ),
+                    _preview_update(gr, "", visible=False),
+                    *reset_result,
+                )
+            return (
+                _pdf_preview_update(gr, None),
+                _preview_update(gr, None, visible=False),
+                _preview_update(gr, "", visible=False),
+                _preview_update(gr, preview_placeholder("unsupported_preview"), visible=True),
+                *reset_result,
+            )
+
+        # 保持公开输入只有文件，访问地址由 Gradio 的请求上下文注入。
+        update_file_preview.__annotations__["request"] = gr.Request
+        private_event_kwargs = {"queue": False, "api_visibility": "private"}
+
+        # 换文件和清除先在浏览器中撤销旧预览，文件输出仍由原有 Python 事件管理。
+        input_file.change(fn=None, inputs=input_file, outputs=pdf_viewer, js=pdf_preview_js("reset"), **private_event_kwargs)
+        clear_button.click(fn=None, inputs=[], outputs=pdf_viewer, js=pdf_preview_js("clear"), **private_event_kwargs)
+
+        source_preparation_ticket = gr.Textbox(value="", visible=False)
+        source_preparation_receipt = gr.Textbox(value="", visible=False)
+        source_ready = gr.Textbox(value="", visible=False)
+
+        upload_control.change(
+            fn=None,
+            inputs=upload_control,
+            outputs=input_file,
+            js="value => window.__mineruUpload.bridge(value)",
+            **private_event_kwargs,
+        )
+
+        async def prepare_uploaded_source(file_path: str | None, ticket: str, request: object | None = None) -> str:
+            """上传后立即准备稳定输入，迟到回执由前端选择身份拦截。"""
+            if not ticket:
+                return ""
+            identity = json.loads(ticket)
+            source_id = uuid.UUID(identity["id"]).hex
+            revision = identity["revision"]
+            if type(revision) is not int or revision <= 0 or identity["path"] != (file_path or ""):
+                return ""
+            session = getattr(request, "session_hash", "") or ""
+            receipt = {"id": source_id, "path": file_path or "", "pdf": None, "error": ""}
+            try:
+                if not file_path or _file_suffix(file_path) not in PDF_EXTENSIONS | IMAGE_EXTENSIONS:
+                    await conversion_service.sources.retire(session, revision=revision)
+                else:
+                    prepared = await conversion_service.sources.prepare(session, Path(file_path), source_id, revision)
+                    if prepared.preview_pdf_path:
+                        path = str(prepared.preview_pdf_path)
+                        receipt["pdf"] = {
+                            "path": path,
+                            "url": f"{_gradio_public_base_url(request)}/gradio_api/file={quote(path, safe='/')}",
+                            "orig_name": prepared.preview_pdf_path.name,
+                        }
+            except Exception as exc:
+                receipt["error"] = str(exc)
+            return json.dumps(receipt, ensure_ascii=False)
+
+        prepare_uploaded_source.__annotations__["request"] = gr.Request
+        prepare_input = input_file.change(
+            fn=None,
+            inputs=input_file,
+            outputs=[source_preparation_ticket, source_ready],
+            js=f"file => [({pdf_preview_js('prepare')})(file), window.__mineruPdfPreview.readyPath]",
+            **private_event_kwargs,
+        )
+        prepare_input.then(
+            fn=prepare_uploaded_source,
+            inputs=[input_file, source_preparation_ticket],
+            outputs=source_preparation_receipt,
+            trigger_mode="multiple",
+            show_progress="hidden",
+            **private_event_kwargs,
+        )
+        source_preparation_receipt.change(
+            fn=None,
+            inputs=source_preparation_receipt,
+            outputs=source_ready,
+            js=pdf_preview_js("prepared"),
+            **private_event_kwargs,
+        )
+
+        async def retire_uploaded_source(ticket: str, request: object | None = None) -> None:
+            """显式清除独立释放输入租期，不依赖隐藏 File 的重复或空值变更事件。"""
+            identity = json.loads(ticket)
+            revision = identity.get("revision")
+            if identity.get("path") == "" and type(revision) is int and revision > 0:
+                await conversion_service.sources.retire(getattr(request, "session_hash", "") or "", revision=revision)
+
+        retire_uploaded_source.__annotations__["request"] = gr.Request
+        clear_source = clear_button.click(
+            fn=None,
+            inputs=[],
+            outputs=[source_preparation_ticket, source_ready],
+            js=f"() => {{ ({pdf_preview_js('clear')})(); return [({pdf_preview_js('prepare')})(null), '']; }}",
+            **private_event_kwargs,
+        )
+        clear_source.then(fn=retire_uploaded_source, inputs=source_preparation_ticket, outputs=[], **private_event_kwargs)
+
+        source_script = _resource_text("gradio_source_preview.js")
+        begin_source_preview = input_file.change(
+            fn=None,
+            inputs=input_file,
+            outputs=[source_ticket, source_preview],
+            js=f"(...args) => ({source_script})('begin', ...args)",
+            **private_event_kwargs,
+        )
+        # 前端先失效旧预览并生成票据，再串联后端；票据仍用于丢弃迟到回执。
+        render_source_preview = begin_source_preview.then(
+            fn=prepare_source_preview,
+            inputs=[input_file, source_ticket],
+            outputs=source_receipt,
+            concurrency_limit=None,
+            trigger_mode="multiple",
+            **private_event_kwargs,
+        )
+        render_source_preview.then(
+            fn=None,
+            inputs=[source_receipt, epub_viewer_entry_component],
+            outputs=source_preview,
+            js=f"(...args) => ({source_script})('apply', ...args)",
+            **private_event_kwargs,
+        )
+        clear_button.click(
+            fn=None,
+            inputs=[],
+            outputs=[source_ticket, source_preview],
+            js=f"(...args) => ({source_script})('clear', ...args)",
+            **private_event_kwargs,
+        )
+
+        download_script = _resource_text("gradio_download.js")
+
+        def download_js(action: str, format_name: str = "", label: str = "") -> str:
+            """为下载事件绑定明确的动作与格式，复用同一份前端状态处理脚本。"""
+            arguments = ", ".join(json.dumps(value) for value in (action, _DOWNLOAD_FORMATS, format_name, label))
+            return f"(...args) => ({download_script})({arguments}, ...args)"
+
+        download_reset_outputs = [
+            active_run_id,
+            *download_files.values(),
+            *download_requests.values(),
+            *download_receipts.values(),
+            *download_buttons.values(),
+            download_notice,
+        ]
+        # 文件切换只重置下载控件；转换点击另加状态卡片，避免重置结果错位清空卡片。
+        begin_conversion_outputs = [status_panel, *download_reset_outputs]
+
+        # 匹配选择票据后才重置下载，重复文件事件与迟到票据保留当前结果。
+        prepare_input.then(
+            fn=None,
+            inputs=source_preparation_ticket,
+            outputs=download_reset_outputs,
+            js=download_js("source"),
+            **private_event_kwargs,
+        )
+        # 显式清除立即失效下载，不等待上传或转换的 Python 回调。
+        clear_button.click(
+            fn=None,
+            inputs=[],
+            outputs=download_reset_outputs,
+            js=download_js("reset"),
+            **private_event_kwargs,
+        )
+        active_run_id.change(fn=None, inputs=active_run_id, outputs=[], js=download_js("activate"), **private_event_kwargs)
+
+        def update_ocr_control(file_path: str | None) -> Any:
+            """仅为原始 PDF 显示开关，并在更换或清除文件时重置为自动判断。"""
+            return gr.update(value=False, visible=_file_suffix(file_path) in PDF_EXTENSIONS)
+
+        input_file.change(
+            fn=update_ocr_control,
+            inputs=input_file,
+            outputs=force_ocr,
+            trigger_mode="always_last",
+            **private_event_kwargs,
+        )
+
+        async def cancel_session_conversion(request: object | None = None) -> None:
+            """取消会话任务，并等待同步输出退出后回收后台工作。"""
+            task = conversions.cancel(getattr(request, "session_hash", "") or "")
+            if task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await await_task_completion(task)
+
+        cancel_session_conversion.__annotations__["request"] = gr.Request
+
+        # 显式注册幂等加载事件，初始化前端状态和自定义文案。
+        demo.load(fn=None, inputs=pdf_viewer_entry, js=app_js, **private_event_kwargs)
+        preview_outputs = [
+            pdf_preview,
+            image_preview,
+            office_preview,
+            generic_preview,
+            status_panel,
+            html_output,
+            artifact_state,
+            active_run_id,
+            *download_buttons.values(),
+            json_output,
+        ]
+
+        # 文件页数只在上传后读取；前端缓存元数据，tier 切换和拖动不发起 Python 请求。
+        range_inputs = [
+            input_file,
+            tier_control,
+            page_metadata,
+            page_selection,
+            page_control,
+            tier_selection,
+            source_ready,
+            page_start,
+            page_end,
+        ]
+        range_outputs = [
+            page_control,
+            page_summary,
+            page_range,
+            page_selection,
+            convert_button,
+            page_notice,
+            tier,
+            tier_control,
+            tier_selection,
+            page_start,
+            page_end,
+            page_preset,
+        ]
+        range_script = _resource_text("gradio_page_range.js").replace(
+            "__MINERU_PAGE_RANGE_MODEL__", _resource_text("gradio_page_range_model.js")
+        )
+        # 共用一个 always_last 事件流，避免文件、元数据、清除与拖动的并行回调互相覆盖。
+        gr.on(
+            triggers=[
+                input_file.change,
+                tier_control.input,
+                page_metadata.change,
+                page_control.input,
+                source_ready.change,
+                page_start.submit,
+                page_start.blur,
+                page_end.submit,
+                page_end.blur,
+            ],
+            fn=None,
+            inputs=range_inputs,
+            outputs=range_outputs,
+            js=(
+                f"(...args) => ({range_script})({json.dumps(tier_choices)}, "
+                f"{json.dumps(sorted(FLASH_ONLY_PARSE_EXTENSIONS))}, {json.dumps(max_pages)}, ...args)"
+            ),
+            trigger_mode="always_last",
+            **private_event_kwargs,
+        )
+        # 快捷选择仍调用同一状态机，一次更新两端、精确输入和提交范围。
+        page_preset.click(
+            fn=None,
+            inputs=range_inputs,
+            outputs=range_outputs,
+            js=(
+                f"(...args) => ({range_script})({json.dumps(tier_choices)}, "
+                f"{json.dumps(sorted(FLASH_ONLY_PARSE_EXTENSIONS))}, {json.dumps(max_pages)}, ...args, true)"
+            ),
+            **private_event_kwargs,
+        )
+
+        def read_page_metadata(file_path: str | None) -> str:
+            """把页数元数据编码为 JSON 文本，保持前端状态输入契约稳定。"""
+            return json.dumps(document_io.pdf_page_metadata(file_path), ensure_ascii=False)
+
+        input_file.change(
+            fn=read_page_metadata,
+            inputs=input_file,
+            outputs=page_metadata,
+            trigger_mode="always_last",
+            show_progress="hidden",
+            **private_event_kwargs,
+        )
+
+        async def convert_handler(
+            file_path: str | None,
+            tier_position: int | float,
+            raw_page_range: str,
+            force_ocr: bool = False,
+            request: object | None = None,
+        ) -> tuple[object, ...]:
+            """保留公开转换 API 的四个输入和原生组件输出，普通响应一次返回结果。"""
+            session_hash = getattr(request, "session_hash", None)
+            session = session_hash or uuid.uuid4().hex
+            run = conversions.start(session, uuid.uuid4().hex)
+            assert run is not None
+            try:
+                outcome = await conversion_service.execute(
+                    run,
+                    ConversionInput(file_path, tier_position, raw_page_range, force_ocr, session),
+                    public_base_url=_gradio_public_base_url(request),
+                )
+                return conversion_updates(outcome, status_html=run.state.render(), download_formats=_DOWNLOAD_FORMATS)
+            finally:
+                conversions.cancel(session, run.run_id)
+                if not session_hash:
+                    await conversion_service.sources.retire(session)
+
+        convert_outputs = [
+            status_panel,
+            html_output,
+            pdf_preview,
+            image_preview,
+            office_preview,
+            generic_preview,
+            artifact_state,
+            active_run_id,
+            *download_buttons.values(),
+            json_output,
+        ]
+        # Gradio 在读取函数签名时需要真实的 Request 类型对象；注解在运行时补回以保持延迟导入。
+        convert_handler.__annotations__["request"] = gr.Request
+        event_kwargs: dict[str, Any] = {
+            "queue": True,
+            "show_progress": "hidden",
+            "concurrency_limit": None,
+            "api_visibility": "public" if enable_api else "private",
+        }
+        # 公开 API 仍由 Gradio 原生组件序列化，浏览器通过私有回执校验后才应用结果。
+        convert_event = api_conversion_button.click(
+            fn=convert_handler,
+            inputs=[input_file, tier, page_range, force_ocr],
+            outputs=convert_outputs,
+            **event_kwargs,
+        )
+        conversion_script = _resource_text("gradio_conversion.js")
+
+        def conversion_js(action: str) -> str:
+            """绑定自有任务协调脚本，不访问 Gradio 的内部状态或差分缓存。"""
+            return f"(...args) => ({conversion_script})({json.dumps(action)}, ...args)"
+
+        def read_conversion_status(ticket: str, request: object | None = None) -> str:
+            """普通请求返回完整快照；没有有效任务时不创建新的轮询状态。"""
+            try:
+                run_id = json.loads(ticket)["run_id"]
+            except (ValueError, TypeError, KeyError):
+                return ""
+            run = conversions.current(getattr(request, "session_hash", "") or "", run_id)
+            return run.snapshot if run is not None else ""
+
+        async def cancel_ui_conversion(ticket: str, request: object | None = None) -> None:
+            """只取消浏览器刚刚撤销的那次任务，避免晚到请求误伤新任务。"""
+            try:
+                identity = json.loads(ticket)
+                run_id = uuid.UUID(identity["run_id"]).hex
+                revision = identity["revision"]
+                if type(revision) is not int or revision <= 0:
+                    return
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return
+            session = getattr(request, "session_hash", "") or ""
+            # 取消可能先于队列中的提交到达，记住修订号以拒绝尚未开始的旧请求。
+            conversions.revisions[session] = max(conversions.revisions.get(session, 0), revision)
+            task = conversions.cancel(session, run_id)
+            if task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await await_task_completion(task)
+
+        async def unload_session(request: object | None = None) -> None:
+            """标签页关闭后释放会话快照，并等待剩余同步任务退出。"""
+            await cancel_session_conversion(request)
+            await conversion_service.sources.retire(getattr(request, "session_hash", "") or "")
+            preview_identities.pop(getattr(request, "session_hash", "") or "", None)
+            conversions.revisions.pop(getattr(request, "session_hash", "") or "", None)
+
+        async def convert_ui(
+            file_path: str | None,
+            tier_position: int | float,
+            raw_page_range: str,
+            force_ocr: bool,
+            ticket: str,
+            request: object | None = None,
+        ) -> str:
+            """用完整回执传递浏览器结果，使迟到响应无法直接覆盖可见组件。"""
+            try:
+                identity = json.loads(ticket)
+                run_id = uuid.UUID(identity["run_id"]).hex
+                revision = identity["revision"]
+                if type(revision) is not int or revision <= 0:
+                    return ""
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return ""
+            session = getattr(request, "session_hash", "") or ""
+            run = conversions.start(session, run_id, revision=revision)
+            if run is None:
+                return ""
+            public_base_url = _gradio_public_base_url(request)
+            outcome = await conversion_service.execute(
+                run,
+                ConversionInput(file_path, tier_position, raw_page_range, force_ocr, session, identity.get("source_id", "")),
+                public_base_url=public_base_url,
+            )
+            if conversions.current(session, run_id) is not run:
+                return ""
+            return build_conversion_receipt(
+                outcome,
+                status_html=run.state.render(),
+                run_id=run_id,
+                sequence=run.state.sequence,
+                output_root=output_root,
+                public_base_url=public_base_url,
+                download_formats=_DOWNLOAD_FORMATS,
+            )
+
+        for callback in (read_conversion_status, cancel_ui_conversion, unload_session, convert_ui):
+            callback.__annotations__["request"] = gr.Request
+        # 前端先建立任务身份并重置界面，再串联后端提交。
+        begin_conversion = convert_button.click(
+            fn=None,
+            inputs=[],
+            outputs=[*begin_conversion_outputs, conversion_ticket, status_poll, html_output, json_output],
+            js=(
+                f"() => {{ ({pdf_preview_js('begin')})(); "
+                f"const ticket = ({conversion_js('begin')})(); "
+                f"return [{json.dumps(_status_html(STATUS_PREPARING_REQUEST))}, "
+                f"...({download_js('reset')})(), ...ticket, '', '']; }}"
+            ),
+            **private_event_kwargs,
+        )
+        ui_convert_event = begin_conversion.then(
+            fn=convert_ui,
+            # 直接读取胶囊已提交值，避免快速点击转换时等待隐藏 API 数值的联动回写。
+            inputs=[input_file, tier_control, page_range, force_ocr, conversion_ticket],
+            outputs=conversion_receipt,
+            queue=True,
+            concurrency_limit=None,
+            trigger_mode="multiple",
+            show_progress="hidden",
+            api_visibility="private",
+        )
+        status_poll.tick(
+            fn=read_conversion_status,
+            inputs=conversion_ticket,
+            outputs=status_snapshot,
+            trigger_mode="always_last",
+            show_progress="hidden",
+            **private_event_kwargs,
+        )
+        status_snapshot.change(
+            fn=None,
+            inputs=status_snapshot,
+            outputs=[status_panel, status_poll],
+            js=conversion_js("status"),
+            **private_event_kwargs,
+        )
+        ui_result_outputs = [*convert_outputs[:6], *convert_outputs[7:], status_poll]
+        conversion_receipt.change(
+            fn=None,
+            inputs=[conversion_receipt, input_file, pdf_viewer_entry],
+            outputs=[*ui_result_outputs, pdf_viewer],
+            js=(
+                "(receipt, source, viewer) => { "
+                f"const values = ({conversion_js('result')})(receipt); "
+                "const pdf = values[2]; "
+                f"const preview = pdf?.__type__ === 'update' && 'value' in pdf ? ({pdf_preview_js('result')})("
+                "pdf.value, source, viewer, values[6]) : {__type__: 'update'}; "
+                "return [...values, preview]; }"
+            ),
+            **private_event_kwargs,
+        )
+        gr.on(
+            triggers=[input_file.change, clear_button.click],
+            fn=None,
+            inputs=input_file,
+            outputs=[conversion_ticket, conversion_cancel, status_poll],
+            js=conversion_js("cancel_source"),
+            **private_event_kwargs,
+        )
+        conversion_cancel.change(
+            fn=cancel_ui_conversion,
+            inputs=conversion_cancel,
+            outputs=[],
+            trigger_mode="multiple",
+            **private_event_kwargs,
+        )
+        demo.unload(unload_session)
+        source_preview_event = prepare_input.then(
+            fn=update_file_preview,
+            inputs=[input_file, source_preparation_ticket],
+            outputs=preview_outputs,
+            # 示例切换也会触发文件变更，预览准备期间保持状态卡片可见。
+            show_progress="hidden",
+            **private_event_kwargs,
+        )
+        # 成功事件接收已经序列化的原生 FileData，避免首次挂载时丢失 URL。
+        source_preview_event.success(
+            fn=None,
+            inputs=[pdf_preview, input_file, pdf_viewer_entry],
+            outputs=pdf_viewer,
+            js=pdf_preview_js("source"),
+            **private_event_kwargs,
+        )
+        convert_event.success(
+            fn=None,
+            inputs=[pdf_preview, input_file, pdf_viewer_entry, active_run_id],
+            outputs=pdf_viewer,
+            js=pdf_preview_js("result"),
+            **private_event_kwargs,
+        )
+
+        reset_outputs = [
+            status_panel,
+            html_output,
+            pdf_preview,
+            image_preview,
+            office_preview,
+            generic_preview,
+            artifact_state,
+            active_run_id,
+            *download_buttons.values(),
+            json_output,
+        ]
+
+        def reset_ui() -> tuple[Any, ...]:
+            """清除当前任务结果并恢复空预览状态。"""
+            return (
+                _status_html(_DEFAULT_STATUS),
+                "",
+                _pdf_preview_update(gr, None),
+                gr.update(value=None, visible=False),
+                gr.update(value="", visible=False),
+                gr.update(value=preview_placeholder("empty_preview"), visible=True),
+                None,
+                *download_updates(_DOWNLOAD_FORMATS, interactive=False),
+                "",
+            )
+
+        clear_button.click(
+            fn=reset_ui, inputs=[], outputs=reset_outputs, cancels=[convert_event, ui_convert_event], **private_event_kwargs
+        )
+
+        def session_download_handler(format_name: str) -> Callable[..., tuple[Any, str]]:
+            """下载时读取当前会话的素材路径，公开 API 的 State 仍可单独使用。"""
+            renderer = _download_handler(format_name, output_root)
+
+            def handler(state: dict[str, Any] | None, token: str, request: object | None = None) -> tuple[Any, str]:
+                """使用服务端当前任务核对下载标识，拒绝过期下载请求。"""
+                run = conversions.runs.get(getattr(request, "session_hash", "") or "")
+                if run is not None:
+                    state = run.artifacts if not run.cancelled else None
+                return renderer(state, token, request)
+
+            return handler
+
+        for format_name, label in _DOWNLOAD_FORMATS:
+            begin_download = download_buttons[format_name].click(
+                fn=None,
+                inputs=active_run_id,
+                outputs=[download_requests[format_name], download_buttons[format_name], download_notice],
+                js=download_js("begin", format_name, label),
+                **private_event_kwargs,
+            )
+            download_handler = session_download_handler(format_name)
+            download_handler.__annotations__["request"] = gr.Request
+            prepare_download = begin_download.then(
+                fn=download_handler,
+                inputs=[artifact_state, download_requests[format_name]],
+                outputs=[download_files[format_name], download_receipts[format_name]],
+                queue=True,
+                show_progress="hidden",
+                api_visibility="private",
+            )
+            prepare_download.success(
+                fn=None,
+                inputs=[download_files[format_name], download_receipts[format_name], active_run_id],
+                outputs=[download_buttons[format_name], download_notice],
+                js=download_js("complete", format_name, label),
+                **private_event_kwargs,
+            )
+
+    demo._mineru_kit_css = app_css
+    demo._mineru_kit_js = app_js
+    demo._mineru_kit_launch_kwargs = {"i18n": i18n, "css": app_css, "js": app_js}
+    demo.queue(default_concurrency_limit=1)
+    return demo
+
+
+@with_setup_loop
+def _launch_gradio_app(demo: Any, *, server_name: str, server_port: int | None, output_root: Path) -> None:
+    """在受管理的组装循环中启动服务，覆盖 launch 再次创建 Gradio App 的路径。"""
+    demo.launch(
+        server_name=server_name,
+        server_port=server_port,
+        allowed_paths=[str(output_root)],
+        **demo._mineru_kit_launch_kwargs,
+    )
+
+
+def launch_gradio(
+    *,
+    api_url: str | None,
+    api_key: str | None,
+    server_name: str,
+    server_port: int | None,
+    output_dir: str,
+    enable_example: bool,
+    enable_api: bool,
+    tier: ServerStartupTier = "auto",
+    api_server_concurrency: int,
+    api_server_disable_image_analysis: bool,
+    api_server_preload_models: bool,
+    max_pages: int | None = None,
+) -> None:
+    """连接外部服务或托管一个本地服务，原生文档始终由同一服务解析。"""
+    configure_standard_streams()
+    configure_global_log_level()
+    validate_max_pages(max_pages)
+    resolved_api_key = api_key if api_key is not None else os.environ.get("MINERU_API_KEY")
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    managed_server: ManagedLocalApiServer | None = None
+    resolved_api_url = api_url
+    try:
+        if resolved_api_url is None:
+            managed_server = ManagedLocalApiServer(
+                tier=tier,
+                concurrency=api_server_concurrency,
+                disable_image_analysis=api_server_disable_image_analysis,
+                preload_models=api_server_preload_models,
+                api_key=resolved_api_key,
+            )
+            resolved_api_url = managed_server.start()
+        client = V1ArtifactClient(api_url=resolved_api_url, api_key=resolved_api_key)
+        asyncio.run(client.discover())
+        routed_client = GradioArtifactClient(client)
+        demo = build_gradio_app(
+            routed_client,
+            routed_client.capabilities,
+            output_root=output_root,
+            enable_example=enable_example,
+            enable_api=enable_api,
+            max_pages=max_pages,
+            runtime_device_loader=routed_client.read_runtime_device,
+        )
+        _launch_gradio_app(
+            demo,
+            server_name=server_name,
+            server_port=server_port,
+            output_root=output_root,
+        )
+    finally:
+        if managed_server is not None:
+            managed_server.stop()
+
+
+def _example_files(file_types: list[str]) -> list[str]:
+    """读取当前工作目录 examples 下的受支持示例文件。"""
+    example_root = Path.cwd() / "examples"
+    if not example_root.is_dir():
+        return []
+    suffixes = set(file_types)
+    return [str(path) for path in sorted(example_root.iterdir()) if path.is_file() and path.suffix.lower() in suffixes]
+
+
+# 示例数量预期很小；单页放全部文件，翻页交给卡片内部滚动。
+_EXAMPLES_PER_PAGE = 1000
+
+
+def _gradio_public_base_url(request: object | None = None) -> str:
+    """从 Gradio 请求获取当前外部站点根地址，保留反向代理协议、域名和挂载路径。"""
+    headers = getattr(request, "headers", None) or {}
+    raw_request = getattr(request, "request", None)
+    request_url = getattr(raw_request, "url", None)
+    host = headers.get("x-forwarded-host") or headers.get("host") or getattr(request_url, "netloc", "localhost:7860")
+    protocol = headers.get("x-forwarded-proto") or getattr(request_url, "scheme", "http")
+    host = host.split(",", 1)[0].strip()
+    protocol = protocol.split(",", 1)[0].strip()
+    scope = getattr(raw_request, "scope", None) or {}
+    root_path = scope.get("root_path", "")
+    if root_path.startswith(("http://", "https://")):
+        return root_path.rstrip("/")
+    root_path = "/" + root_path.strip("/") if root_path else ""
+    return f"{protocol}://{host}{root_path}"
+
+
+def _build_office_preview_html(file_path: str | Path, request: object | None = None) -> str:
+    """复用 3.4.5 的上传即预览结构；短地址只供展示，iframe 始终使用完整地址。"""
+    source_path = Path(file_path)
+    headers = getattr(request, "headers", None) or {}
+    host = headers.get("x-forwarded-host") or headers.get("host") or "localhost:7860"
+    protocol = headers.get("x-forwarded-proto") or "http"
+    public_url = f"{protocol}://{host}/gradio_api/file={quote(source_path.as_posix(), safe='/:')}"
+    short_name = f"{source_path.stem[-12:]}{source_path.suffix}" if source_path.stem else source_path.name
+    short_public_url = f"{protocol}://{host}/....{short_name}"
+    viewer_url = "https://view.officeapps.live.com/op/embed.aspx?src=" + quote(public_url, safe="")
+    return (
+        '<div class="office-preview-shell">'
+        '<div class="office-preview-notice">'
+        '<div class="office-preview-copy">'
+        f"<strong>{localized_text('office_preview_title')}</strong>"
+        f"<span>{localized_text('office_notice')}</span>"
+        '<div class="office-preview-source-link">'
+        f"{localized_text('office_preview_source_link')}: {html.escape(short_public_url, quote=True)}</div>"
+        "</div>"
+        '<div class="office-preview-actions">'
+        f'<button type="button" class="office-preview-ignore-once">{localized_text("ignore_once")}</button>'
+        f'<button type="button" class="office-preview-ignore-forever">{localized_text("ignore_forever")}</button>'
+        "</div>"
+        "</div>"
+        f'<iframe class="office-preview-frame" src="{html.escape(viewer_url, quote=True)}" frameborder="0"></iframe>'
+        "</div>"
+    )
+
+
+def _download_handler(format_name: str, output_root: Path) -> Callable[..., tuple[str | None, str]]:
+    """创建一个绑定格式和 output root 的 Gradio 下载回调。"""
+
+    def handler(state: object, request_token: str, request: object | None = None) -> tuple[str | None, str]:
+        """校验请求所属结果，返回文件与回执；生成失败也交给前端按请求标识恢复按钮。"""
+        receipt = {"request": request_token, "error": ""}
+        try:
+            token = json.loads(request_token)
+            artifacts = RunArtifacts.from_state(state)
+            if token["run_id"] != artifacts.root.name:
+                raise ValueError("解析结果已变更，请重新下载。")
+            path = render_download(
+                state,
+                format_name,
+                allowed_root=output_root,
+                public_base_url=_gradio_public_base_url(request),
+            )
+            return path, json.dumps(receipt, ensure_ascii=False)
+        except Exception as exc:
+            receipt["error"] = str(exc)
+            return None, json.dumps(receipt, ensure_ascii=False)
+
+    return handler
+
+
+__all__ = ["build_gradio_app", "launch_gradio"]

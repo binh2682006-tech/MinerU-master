@@ -1,0 +1,1517 @@
+"""New doclib HTTP server implementation backed by the public interface."""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from typing import Any, cast
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+
+from ..config import Config, validate_doclib_token
+from ..errors import InvalidRequestError, MineruError, NotFoundError, error_response, http_status_for
+from ..filetypes import TEXT_EXTENSIONS, TEXT_FILE_TYPES
+from ..model.download import verify_model_repo
+from ..model.registry import ModelRepo, model_repos_for_tier
+from ..parser.page_range import (
+    expand_page_range as _expand_page_range,
+)
+from ..parser.page_range import (
+    normalize_page_range_input,
+    normalize_result_page_range,
+    parse_page_range_set,
+)
+from ..parser.tier import TierDependencyError, ensure_tier_runtime_dependencies
+from ..parser.server_tiers import model_tier_for_server_tiers
+from ..types import (
+    MANAGED_SERVER_TIERS,
+    ManagedServerTier,
+    Tier,
+)
+from ..version import __version__
+from .auth import DoclibAuthMiddleware
+from .background.parse_server_health import get_managed_parse_server_tier
+from .parse_server_state import ParseServerHealth, ProbeResult
+from .base import AsyncDoclibInterface
+from .config_schema import validate_config_value
+from .core.db import DatabaseManager
+from .core.parse_artifacts import parse_batch_is_readable, parse_coverage
+from .remote_api import REMOTE_API_KEY_CONFIG, resolve_remote_api_key
+from .rows import (
+    ContentSearchResultRow,
+    DocRow,
+    ErrorBucketRow,
+    ExcludeRuleRow,
+    FilenameSearchResultRow,
+    FileRow,
+    ParseRow,
+    ParsingRuleRow,
+    RecentScanRow,
+    Sha256Row,
+    ShortIdRow,
+    WatchParseCountRow,
+    WatchStatsFileRow,
+    WatchTargetRow,
+)
+from .services.content_read_svc import ContentReadService
+from .telemetry.buckets import pages_bucket, results_bucket
+from .types import (
+    FILE_STATUS_ACTIVE,
+    FILE_STATUS_DELETED,
+    FILE_STATUS_UNREACHABLE,
+    PARSE_STATUS_DONE,
+    PARSE_STATUS_FAILED,
+    PARSE_STATUS_PARSING,
+    PARSE_STATUS_PENDING,
+    PARSE_STATUS_SUPERSEDED,
+    RULE_TYPE_EXCLUDE,
+    RULE_TYPE_PARSING_RULE,
+    SCAN_KIND_WATCH,
+    SCAN_SOURCE_WATCH,
+    CleanupDeletedRequest,
+    CleanupDeletedResponse,
+    CleanupOrphansRequest,
+    CleanupOrphansResponse,
+    CleanupTempRequest,
+    CleanupTempResponse,
+    ConfigResponse,
+    ConfigSetRequest,
+    ConfigSetResponse,
+    ConfigSource,
+    ConfigUnsetResponse,
+    ConfigValueResponse,
+    ContentFormat,
+    DocContentExportRequest,
+    DocContentExportResponse,
+    DocContentResponse,
+    DocInfo,
+    ErrorBucket,
+    ErrorSummary,
+    ExcludeRuleInfo,
+    ExcludeRuleListResponse,
+    ExcludeRuleRequest,
+    FileInfo,
+    FileInfoResponse,
+    FileStatus,
+    FindResponse,
+    FindResult,
+    ForgetPathRequest,
+    ForgetPathResponse,
+    ImageFormat,
+    InvalidateRequest,
+    InvalidateResponse,
+    ListDocsResponse,
+    ListFilesResponse,
+    ListParsesResponse,
+    LocalParseServerStatus,
+    ParseCoverage,
+    ParseInfo,
+    ParseRequest,
+    ParseResponse,
+    ParseServerStatus,
+    ParseStatus,
+    ParsingRuleInfo,
+    ParsingRuleListResponse,
+    ParsingRuleRequest,
+    RemoteParseServerStatus,
+    RemoteUsageResponse,
+    RemoveExcludeRuleResponse,
+    RemoveParsingRuleResponse,
+    RemoveWatchResponse,
+    ScanInfo,
+    ScanKind,
+    ScanListResponse,
+    ScanRequest,
+    ScanStatus,
+    SearchResponse,
+    SearchResult,
+    ServerStatusResponse,
+    ShutdownResponse,
+    TCPServerStatus,
+    TelemetryAction,
+    TelemetryActionResponse,
+    TelemetryObservation,
+    TelemetryObservationsRequest,
+    TelemetryObservationsResponse,
+    TelemetryPayload,
+    TelemetryPreviewResponse,
+    TelemetryStatusResponse,
+    TierParseInfo,
+    WatchInfo,
+    WatchListResponse,
+    WatchRequest,
+    WatchStats,
+    WorkerStatus,
+)
+from .utils.route_utils import get_route_info, has_route_info, route
+
+_NO_MATCHING_DOC_SHA256 = "__mineru_no_matching_doc__"
+
+
+class DoclibServer(AsyncDoclibInterface):
+    """Async doclib server whose routes are declared on interface methods."""
+
+    def __init__(self, state: Any, *, config: Config, health: ParseServerHealth, title: str = "MinerU Doclib API") -> None:
+        """绑定宿主的配置快照和健康状态，不读取进程默认实例。"""
+        self.config = config
+        self.health = health
+        self.state = state
+        if config.doclib.auth.token is None:
+            raise ValueError("DoclibServer requires doclib.auth.token; use the standard server startup to generate it.")
+        validate_doclib_token(config.doclib.auth.token.get_secret_value())
+        self.app = FastAPI(
+            title=title,
+            docs_url="/api/docs",
+            redoc_url="/api/redoc",
+            openapi_url="/api/openapi.json",
+        )
+        self.app.add_middleware(DoclibAuthMiddleware, token=config.doclib.auth.token)
+        self.app.add_exception_handler(MineruError, _mineru_error_handler)
+        self.app.add_exception_handler(Exception, _unexpected_error_handler)
+        self.app.include_router(self._build_router())
+
+    def _content_read_service(self) -> ContentReadService:
+        """将当前应用已初始化的数据库与产物目录传给内容服务。"""
+        return ContentReadService(
+            self.state.db,
+            data_dir=_effective_data_dir(self.state, self.config),
+            latex_delimiters=self.config.render.latex_delimiters,
+        )
+
+    def _build_router(self) -> APIRouter:
+        endpoints = []
+        for attr_name in dir(self):
+            endpoint = getattr(self, attr_name)
+            if callable(endpoint) and has_route_info(endpoint):
+                route_info = get_route_info(endpoint)
+                endpoints.append((route_info.index, route_info, endpoint))
+
+        router = APIRouter(prefix="/api/v1")
+        for _, route_info, endpoint in sorted(endpoints):
+            router.add_api_route(
+                path=route_info.path,
+                endpoint=endpoint,
+                methods=[route_info.method],
+                tags=list(route_info.tags),
+            )
+        return router
+
+    @route("GET", "/server/status", tags=("server",))
+    async def get_server_status(self) -> ServerStatusResponse:
+        files_total = await self.state.db.fetchone("SELECT COUNT(*) as cnt FROM files WHERE status=?", (FILE_STATUS_ACTIVE,))
+        docs_total = await self.state.db.fetchone("SELECT COUNT(*) as cnt FROM docs")
+        active_scans = await self.state.db.fetchone(
+            "SELECT COUNT(*) as cnt FROM scans WHERE status IN (?, ?)",
+            ("pending", "running"),
+        )
+        last_scan = await self.state.db.fetchone(
+            "SELECT MAX(COALESCE(finished_at, updated_at)) as ts FROM scans WHERE status IN (?, ?)",
+            ("done", "failed"),
+        )
+        ingest_q = await self.state.db.fetchone(
+            "SELECT COUNT(*) as cnt FROM files WHERE sha256 IS NULL AND status=? AND error_code IS NULL",
+            (FILE_STATUS_ACTIVE,),
+        )
+        local_mode = (await self.state.config_svc.get("parse_server.local.mode")) or "disabled"
+        managed_tier = await get_managed_parse_server_tier(self.state.config_svc)
+        self_hosted_url = await self.state.config_svc.get("parse_server.local.self_hosted_url")
+        remote_url = await self.state.config_svc.get("parse_server.remote.url")
+        watches = await self.state.config_svc.list_watches()
+        uptime = time.time() - self.state.start_time if hasattr(self.state, "start_time") else 0
+        sqlite_path = getattr(self.state, "sqlite_path", "")
+        log_path = getattr(self.state, "log_path", "") or self.config.doclib.log.resolved_app_path
+        access_log_path = getattr(self.state, "access_log_path", "") or self.config.doclib.log.resolved_access_path
+        stdout_log_path = getattr(self.state, "stdout_log_path", "") or self.config.doclib.log.resolved_stdout_path
+        stderr_log_path = getattr(self.state, "stderr_log_path", "") or self.config.doclib.log.resolved_stderr_path
+        parse_server_stdout_log_path = (
+            getattr(self.state, "parse_server_stdout_log_path", "") or self.config.doclib.log.resolved_parse_server_stdout_path
+        )
+        parse_server_stderr_log_path = (
+            getattr(self.state, "parse_server_stderr_log_path", "") or self.config.doclib.log.resolved_parse_server_stderr_path
+        )
+        sqlite_journal_mode = await _sqlite_journal_mode(self.state.db)
+        health = self.health
+
+        return ServerStatusResponse(
+            running=True,
+            pid=getattr(self.state, "pid", os.getpid()),
+            server_id=getattr(self.state, "server_id", ""),
+            uptime_seconds=uptime,
+            mineru_home=getattr(self.state, "mineru_home", ""),
+            version=__version__,
+            python_version=sys.version.split()[0],
+            socket_path=getattr(self.state, "socket_path", ""),
+            data_dir=getattr(self.state, "data_dir", ""),
+            sqlite_path=sqlite_path,
+            log_path=log_path,
+            access_log_path=access_log_path,
+            stdout_log_path=stdout_log_path,
+            stderr_log_path=stderr_log_path,
+            tcp=TCPServerStatus(
+                enabled=bool(getattr(self.state, "tcp_enabled", False)),
+                host=getattr(self.state, "tcp_host", "") or None,
+                port=getattr(self.state, "tcp_port", None),
+            ),
+            active_scan_count=active_scans["cnt"] if active_scans else 0,
+            last_scan_at=last_scan["ts"] if last_scan else None,
+            sqlite_journal_mode=sqlite_journal_mode,
+            sqlite_size_bytes=_file_size(sqlite_path),
+            sqlite_wal_size_bytes=_file_size(f"{sqlite_path}-wal") if sqlite_path else None,
+            workers=WorkerStatus(
+                watch_running=bool(getattr(self.state.watch, "running", False)),
+                scan_running=bool(getattr(self.state.scan_workers, "running", False)),
+                scan_workers=int(getattr(self.state.scan_workers, "num_workers", 0) or 0),
+                ingest_running=bool(getattr(self.state.ingest_workers, "running", False)),
+                ingest_workers=int(getattr(self.state.ingest_workers, "num_workers", 0) or 0),
+                parse_running=bool(getattr(self.state.parse_workers, "running", False)),
+                parse_workers=int(getattr(self.state.parse_workers, "num_workers", 0) or 0),
+                device_monitor_running=bool(getattr(self.state.device_monitor, "running", False)),
+                compaction_running=bool(getattr(self.state.compaction, "running", False)),
+                health_check_running=bool(getattr(self.state.health_check, "running", False)),
+            ),
+            files_total=files_total["cnt"] if files_total else 0,
+            docs_total=docs_total["cnt"] if docs_total else 0,
+            parse_queue_length=await self.state.parse_queue_svc.get_queue_length(),
+            ingest_queue_length=ingest_q["cnt"] if ingest_q else 0,
+            parse_server=_parse_server_status(
+                local_mode=local_mode,
+                managed_tier=cast(Tier, managed_tier),
+                self_hosted_url=self_hosted_url if self_hosted_url else None,
+                remote_url=remote_url if remote_url else None,
+                health=health,
+            ),
+            watch_count=len(watches),
+            watches=[_watch_info(row) for row in watches],
+            watch_stats=await _watch_stats(self.state.db, watches),
+            recent_scans=await _recent_scans(self.state.db),
+            error_summary=await _error_summary(self.state.db),
+            recent_logs=_tail_log(log_path, lines=25),
+            app_logs=_tail_log(log_path, lines=25),
+            access_logs=_tail_log(access_log_path, lines=10),
+            stdout_logs=_tail_log(stdout_log_path, lines=10),
+            stderr_logs=_tail_log(stderr_log_path, lines=10),
+            parse_server_stdout_logs=_tail_log(parse_server_stdout_log_path, lines=10),
+            parse_server_stderr_logs=_tail_log(parse_server_stderr_log_path, lines=10),
+        )
+
+    @route("POST", "/server/shutdown", tags=("server",))
+    async def shutdown_server(self) -> ShutdownResponse:
+        """通过宿主回调请求优雅关闭，让应用生命周期完成资源回收。"""
+        shutdown = getattr(self.state, "shutdown", None)
+        if shutdown is None:
+            raise MineruError("service_unavailable", "Server shutdown is unavailable for this application host.")
+        result = shutdown()
+        if hasattr(result, "__await__"):
+            await result
+        return ShutdownResponse(accepted=True, message="Server shutting down...")
+
+    @route("POST", "/parses", tags=("parse",))
+    async def ensure_parse(self, request: ParseRequest) -> ParseResponse:
+        start_ms = _now_ms()
+        await _record_telemetry_count(self.state, "parse.request.count")
+        try:
+            result = await self.state.parse_queue_svc.request_parse(
+                request.path,
+                tier=request.tier,
+                page_range=request.page_range,
+                force=request.force,
+                remote=request.remote,
+            )
+            response = ParseResponse.model_validate(result)
+            status = _parse_route_status(response)
+            dims = {"status": status, "tier": response.tier}
+            await _record_telemetry_count(self.state, "parse.finished.count", dimensions=dims)
+            await _record_telemetry_duration(self.state, "parse.duration_bucket.count", start_ms, dimensions=dims)
+            return response
+        except Exception as exc:
+            dims = {"status": "failed", "tier": request.tier or "default", "error_code": _telemetry_error_code(exc)}
+            await _record_telemetry_count(self.state, "parse.finished.count", dimensions=dims)
+            await _record_telemetry_duration(self.state, "parse.duration_bucket.count", start_ms, dimensions=dims)
+            raise
+
+    @route("GET", "/parses", tags=("parse",))
+    async def list_parses(
+        self,
+        *,
+        ids: list[int] | None = None,
+        doc_ref: str | None = None,
+        tier: Tier | None = None,
+        status: ParseStatus | None = None,
+        page_range: str | None = None,
+        include_superseded: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> ListParsesResponse:
+        resolved_sha256 = await self._resolve_doc_filter_sha256(doc_ref)
+        rows, total, limit, offset = await self._select_parse_rows(
+            ids=ids,
+            sha256=resolved_sha256,
+            tier=tier,
+            status=status,
+            include_superseded=include_superseded,
+            limit=limit,
+            offset=offset,
+        )
+        page_range = normalize_page_range_input(page_range)
+        if resolved_sha256 and tier and page_range:
+            doc = await self.state.db.fetchone("SELECT * FROM docs WHERE sha256=?", (resolved_sha256,))
+            if doc is None:
+                raise NotFoundError("doc_not_found", f"Document {resolved_sha256} not found.", "doc_ref")
+            page_range = _expand_page_range(page_range, doc["page_count"] or 1)
+        coverage_rows = [
+            row
+            for row in rows
+            if row["status"] != PARSE_STATUS_DONE
+            or parse_batch_is_readable(_effective_data_dir(self.state, self.config), row["sha256"], row["tier"], row)
+        ]
+        coverage = parse_coverage(page_range, coverage_rows) if resolved_sha256 and tier and page_range else None
+        return ListParsesResponse(
+            parses=[_parse_info(row, coverage=coverage) for row in rows],
+            coverage=coverage,
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @route("GET", "/parses/{parse_id}", tags=("parse",))
+    async def get_parse(self, parse_id: int) -> ParseInfo:
+        row = await self.state.db.fetchone(
+            "SELECT p.*, d.short_id AS short_id FROM parses p JOIN docs d ON d.sha256=p.sha256 WHERE p.id=?",
+            (parse_id,),
+        )
+        if row is None:
+            raise NotFoundError("job_not_found", f"Parse {parse_id} not found.", "parse_id")
+        return _parse_info(row)
+
+    @route("POST", "/invalidate", tags=("parse",))
+    async def invalidate(self, request: InvalidateRequest) -> InvalidateResponse:
+        if request.target != "parses":
+            raise InvalidRequestError("invalid_request", f"Unsupported invalidate target: {request.target}", "target")
+        doc_row = await self._doc_for_ref(request.doc_ref, param="doc_ref") if request.doc_ref else None
+        file_row: FileRow | None = None
+        sha256 = doc_row["sha256"] if doc_row else None
+        if sha256 is None and request.path:
+            file_row = await self.state.ingest_svc.ensure_ingested(request.path)
+            sha256 = file_row["sha256"] if file_row and file_row.get("sha256") else None
+        if sha256 is None:
+            raise NotFoundError("file_not_found", "Document not found.", "path")
+        if (file_row and file_row["ext"] in TEXT_EXTENSIONS) or (doc_row and doc_row["file_type"] in TEXT_FILE_TYPES):
+            raise InvalidRequestError(
+                "parse_not_required",
+                "Text files do not require MinerU parsing. Read the file directly.",
+                "doc_ref" if doc_row else "path",
+            )
+
+        short_id = doc_row["short_id"] if doc_row else await self._short_id_for_sha256(sha256)
+        count = await self.state.parse_queue_svc.invalidate(sha256, request.tier)
+        return InvalidateResponse(
+            target=request.target, sha256=sha256, short_id=short_id, tier=request.tier, invalidated_count=count
+        )
+
+    @route("POST", "/forget", tags=("files",))
+    async def forget_path(self, request: ForgetPathRequest) -> ForgetPathResponse:
+        result = await self.state.cleanup_svc.forget_path(request.path, dry_run=request.dry_run)
+        return ForgetPathResponse.model_validate(result)
+
+    @route("POST", "/scans", tags=("scan",))
+    async def create_scan(self, request: ScanRequest) -> ScanInfo:
+        await _record_telemetry_count(self.state, "scan.request.count")
+        return await self.state.scan_svc.create_scan(
+            request.path,
+            kind=request.kind,
+            source=request.source,
+            watch_id=request.watch_id,
+        )
+
+    @route("GET", "/scans", tags=("scan",))
+    async def list_scans(
+        self,
+        *,
+        limit: int = 50,
+        status: ScanStatus | None = None,
+        kind: ScanKind | None = None,
+        watch_id: int | None = None,
+        offset: int = 0,
+    ) -> ScanListResponse:
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        total = await self.state.scan_svc.count_scans(status=status, kind=kind, watch_id=watch_id)
+        scans = await self.state.scan_svc.list_scans(
+            limit=limit,
+            status=status,
+            kind=kind,
+            watch_id=watch_id,
+            offset=offset,
+        )
+        return ScanListResponse(scans=scans, total=total, limit=limit, offset=offset)
+
+    @route("GET", "/scans/{scan_id}", tags=("scan",))
+    async def get_scan(self, scan_id: int) -> ScanInfo:
+        return await self.state.scan_svc.get_scan(scan_id)
+
+    @route("GET", "/files", tags=("files",))
+    async def list_files(
+        self,
+        *,
+        status: FileStatus | None = None,
+        ext: str | None = None,
+        watch_id: int | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> ListFilesResponse:
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        file_status = status or FILE_STATUS_ACTIVE
+        clauses = ["f.status=?"]
+        params: list[Any] = [file_status]
+        if ext:
+            clauses.append("f.ext=?")
+            params.append(ext.lstrip(".").lower())
+        if watch_id is not None:
+            clauses.append("f.watch_id=?")
+            params.append(watch_id)
+        where = " AND ".join(clauses)
+        total_row = await self.state.db.fetchone(f"SELECT COUNT(*) AS cnt FROM files f WHERE {where}", tuple(params))
+        rows = cast(
+            list[FileRow],
+            await self.state.db.fetchall(
+                f"""
+                SELECT f.*, d.short_id AS short_id
+                FROM files f
+                LEFT JOIN docs d ON d.sha256=f.sha256
+                WHERE {where}
+                ORDER BY f.updated_at DESC LIMIT ? OFFSET ?
+                """,
+                (*params, limit, offset),
+            ),
+        )
+        total = total_row["cnt"] if total_row else 0
+        return ListFilesResponse(files=[_file_info(row) for row in rows], total=total, limit=limit, offset=offset)
+
+    @route("GET", "/docs", tags=("docs",))
+    async def list_docs(
+        self,
+        *,
+        file_type: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> ListDocsResponse:
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if file_type:
+            clauses.append("d.file_type=?")
+            params.append(file_type.lstrip(".").lower())
+        clauses.append("EXISTS (SELECT 1 FROM files f WHERE f.sha256=d.sha256 AND f.status=?)")
+        params.append(FILE_STATUS_ACTIVE)
+        where = " AND ".join(clauses)
+        total_row = await self.state.db.fetchone(f"SELECT COUNT(*) AS cnt FROM docs d WHERE {where}", tuple(params))
+        rows = await self.state.db.fetchall(
+            f"SELECT d.* FROM docs d WHERE {where} ORDER BY d.updated_at DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        total = total_row["cnt"] if total_row else 0
+        return ListDocsResponse(docs=[_doc_info(row) for row in rows], total=total, limit=limit, offset=offset)
+
+    @route("GET", "/docs/by-path", tags=("docs",))
+    async def get_doc_by_path(self, path: str) -> DocInfo:
+        await self.state.ingest_svc.ensure_ingested(path)
+        row = await self.state.db.fetchone(
+            "SELECT d.* FROM docs d JOIN files f ON f.sha256=d.sha256 WHERE f.path=? AND f.status=?",
+            (path, FILE_STATUS_ACTIVE),
+        )
+        if row is None:
+            raise NotFoundError("doc_not_found", f"Document for file {path} not found.", "path")
+        return _doc_info(row)
+
+    @route("GET", "/docs/{doc_ref}", tags=("docs",))
+    async def get_doc(self, doc_ref: str, *, expand_files: bool = False) -> DocInfo:
+        row = await self._doc_for_ref(doc_ref, param="doc_ref")
+        files = await self._files_for_sha256(row["sha256"]) if expand_files else None
+        return _doc_info(row, files=files)
+
+    @route("GET", "/docs/{doc_ref}/content", tags=("docs",))
+    async def get_doc_content(
+        self,
+        doc_ref: str,
+        *,
+        tier: Tier,
+        page_range: str | None = None,
+        after: str | None = None,
+        limit: int = 30000,
+        format: str = "markdown",
+        no_marker: bool = False,
+    ) -> DocContentResponse:
+        start_ms = _now_ms()
+        dims = {"content_mode": "read", "output_format": _telemetry_output_format(format), "tier": tier}
+        await _record_telemetry_count(self.state, "content.request.count", dimensions=dims)
+        try:
+            response = await self._content_read_service().read_document(
+                doc_ref,
+                tier=tier,
+                page_range=page_range,
+                after=after,
+                limit=limit,
+                format=format,
+                no_marker=no_marker,
+            )
+            finished_dims = dims | {"status": "succeeded"}
+            await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
+            await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
+            return response
+        except Exception:
+            finished_dims = dims | {"status": "failed"}
+            await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
+            await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
+            raise
+
+    @route("GET", "/content", tags=("docs",))
+    async def read_content(
+        self,
+        locator: str,
+        *,
+        after: str | None = None,
+        context: int = 0,
+        limit: int = 30000,
+        format: ContentFormat = "markdown",
+        image_format: ImageFormat = "jpeg",
+        no_marker: bool = False,
+    ) -> DocContentResponse:
+        """读取共享语法的页选择；范围续读只访问选择中的未完成内容。"""
+        start_ms = _now_ms()
+        dims = {"content_mode": "read", "output_format": _telemetry_output_format(format), "tier": "unknown"}
+        await _record_telemetry_count(self.state, "content.request.count", dimensions=dims)
+        try:
+            response = await self._content_read_service().read_locator(
+                locator,
+                after=after,
+                context=context,
+                limit=limit,
+                format=format,
+                image_format=image_format,
+                no_marker=no_marker,
+            )
+            finished_dims = dims | {"status": "succeeded", "tier": response.tier}
+            await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
+            await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
+            return response
+        except Exception:
+            finished_dims = dims | {"status": "failed"}
+            await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
+            await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
+            raise
+
+    @route("POST", "/docs/{doc_ref}/exports", tags=("docs",))
+    async def export_doc_content(self, doc_ref: str, request: DocContentExportRequest) -> DocContentExportResponse:
+        start_ms = _now_ms()
+        dims = {"content_mode": "export", "output_format": _telemetry_output_format(request.format), "tier": request.tier}
+        await _record_telemetry_count(self.state, "content.request.count", dimensions=dims)
+        try:
+            response = await self._content_read_service().export_document(doc_ref, request)
+            finished_dims = dims | {"status": "succeeded"}
+            await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
+            await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
+            return response
+        except Exception:
+            finished_dims = dims | {"status": "failed"}
+            await _record_telemetry_count(self.state, "content.finished.count", dimensions=finished_dims)
+            await _record_telemetry_duration(self.state, "content.duration_bucket.count", start_ms, dimensions=finished_dims)
+            raise
+
+    @route("GET", "/search", tags=("search",))
+    async def search(
+        self,
+        query: str,
+        *,
+        file_type: str | None = None,
+        tier: Tier | None = None,
+        min_tier: Tier | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> SearchResponse:
+        start_ms = _now_ms()
+        await _record_telemetry_count(self.state, "search.request.count")
+        try:
+            results, total = await self.state.search_svc.search(
+                query=query,
+                file_type=file_type,
+                tier=tier,
+                min_tier=min_tier,
+                limit=limit,
+                offset=offset,
+            )
+            response = SearchResponse(results=[_search_result(row) for row in results], total=total, query=query)
+            dims = {"status": "succeeded"}
+            await _record_telemetry_count(self.state, "search.finished.count", dimensions=dims)
+            await _record_telemetry_duration(self.state, "search.duration_bucket.count", start_ms, dimensions=dims)
+            await _record_telemetry_count(
+                self.state, "search.results_bucket.count", dimensions={"bucket": results_bucket(total)}
+            )
+            return response
+        except Exception:
+            dims = {"status": "failed"}
+            await _record_telemetry_count(self.state, "search.finished.count", dimensions=dims)
+            await _record_telemetry_duration(self.state, "search.duration_bucket.count", start_ms, dimensions=dims)
+            raise
+
+    @route("GET", "/find", tags=("search",))
+    async def find(self, query: str, *, ext: str | None = None, limit: int = 50, offset: int = 0) -> FindResponse:
+        """返回完整有效匹配数，并按调用方指定的偏移量分页。"""
+        start_ms = _now_ms()
+        await _record_telemetry_count(self.state, "find.request.count")
+        try:
+            results, total = await self.state.search_svc.search_filenames(
+                query=query,
+                ext=ext,
+                limit=limit,
+                offset=offset,
+                refresh_file=self.state.ingest_svc.refresh_file,
+            )
+            response = FindResponse(results=[_find_result(row) for row in results], total=total, query=query)
+            dims = {"status": "succeeded"}
+            await _record_telemetry_count(self.state, "find.finished.count", dimensions=dims)
+            await _record_telemetry_duration(self.state, "find.duration_bucket.count", start_ms, dimensions=dims)
+            await _record_telemetry_count(self.state, "find.results_bucket.count", dimensions={"bucket": results_bucket(total)})
+            return response
+        except Exception:
+            dims = {"status": "failed"}
+            await _record_telemetry_count(self.state, "find.finished.count", dimensions=dims)
+            await _record_telemetry_duration(self.state, "find.duration_bucket.count", start_ms, dimensions=dims)
+            raise
+
+    @route("GET", "/files/by-path", tags=("files",))
+    async def get_file_by_path(self, path: str) -> FileInfoResponse:
+        await self.state.ingest_svc.ensure_ingested(path)
+        file_row = await self.state.db.fetchone(
+            """
+            SELECT f.*, d.short_id AS short_id
+            FROM files f
+            LEFT JOIN docs d ON d.sha256=f.sha256
+            WHERE f.path=? AND f.status=?
+            """,
+            (path, FILE_STATUS_ACTIVE),
+        )
+        if file_row is None:
+            raise NotFoundError("file_not_found", f"File record {path} not found in doclib.", "path")
+        sha256 = file_row["sha256"]
+        doc_row = await self.state.db.fetchone("SELECT * FROM docs WHERE sha256=?", (sha256,)) if sha256 else None
+        parse_rows = (
+            await self.state.db.fetchall(
+                """
+                SELECT p.*, d.short_id AS short_id
+                FROM parses p
+                JOIN docs d ON d.sha256=p.sha256
+                WHERE p.sha256=?
+                ORDER BY p.tier, p.created_at DESC
+                """,
+                (sha256,),
+            )
+            if sha256
+            else []
+        )
+        parsed_tiers = [
+            _tier_parse_info(row)
+            for row in parse_rows
+            if row["status"] == PARSE_STATUS_DONE
+            and parse_batch_is_readable(_effective_data_dir(self.state, self.config), row["sha256"], row["tier"], row)
+        ]
+        active_parses = [
+            _parse_info(row) for row in parse_rows if row["status"] in {PARSE_STATUS_PENDING, PARSE_STATUS_PARSING}
+        ]
+        return FileInfoResponse(
+            file=_file_info(file_row),
+            doc=_doc_info(doc_row) if doc_row else None,
+            parsed_tiers=parsed_tiers,
+            active_parses=active_parses,
+        )
+
+    @route("GET", "/remote-usage", tags=("remote",))
+    async def get_remote_usage(self) -> RemoteUsageResponse:
+        from ..parser.api_client import MinerUApiParser, _APITransportError, _V1APIError
+
+        remote_url = cast(str, await self.state.config_svc.get("parse_server.remote.url"))
+        resolved_api_key = await resolve_remote_api_key(self.state.config_svc)
+        client = MinerUApiParser(api_url=remote_url, api_key=resolved_api_key.value)
+        try:
+            payload = await client.get_usage_async()
+        except _APITransportError as exc:
+            code = "remote_timeout" if exc.timed_out else "remote_unreachable"
+            raise MineruError(
+                code,
+                f"Remote API transport failed during {exc.stage} after {exc.attempts} attempt(s) ({type(exc.cause).__name__}).",
+            ) from exc
+        except _V1APIError as exc:
+            raise MineruError(exc.code, exc.message, exc.param) from exc
+        try:
+            return RemoteUsageResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise MineruError("api_error", "Remote API returned an invalid usage response.") from exc
+
+    @route("GET", "/configs", tags=("config",))
+    async def get_config(self) -> ConfigResponse:
+        config, sources = await self.state.config_svc.get_all_with_sources()
+        resolved_api_key = await resolve_remote_api_key(self.state.config_svc)
+        if resolved_api_key.value is not None:
+            config[REMOTE_API_KEY_CONFIG] = resolved_api_key.value
+            sources[REMOTE_API_KEY_CONFIG] = resolved_api_key.source
+        return ConfigResponse(config=_mask_config(config), sources=sources)
+
+    @route("GET", "/configs/{key}", tags=("config",))
+    async def get_config_key(self, key: str) -> ConfigValueResponse:
+        value, source = await self._effective_config_value(key)
+        return ConfigValueResponse(key=key, value=_mask_config_value(key, value or ""), source=source)
+
+    @route("PUT", "/configs/{key}", tags=("config",))
+    async def set_config(self, key: str, request: ConfigSetRequest) -> ConfigSetResponse:
+        await self._validate_config_set(key, request.value)
+        await self.state.config_svc.set(key, request.value)
+        if key in {"parse_server.local.managed_tier", "parse_server.local.mode"}:
+            await self._refresh_managed_tier_transition()
+        value, source = await self._effective_config_value(key)
+        return ConfigSetResponse(key=key, value=_mask_config_value(key, value or ""), source=source)
+
+    async def _refresh_managed_tier_transition(self) -> None:
+        """按最新有效配置撤销旧托管服务探测结果，并唤醒串行重启任务。"""
+        mode = await self.state.config_svc.get("parse_server.local.mode")
+        health = self.health
+        if mode != "managed":
+            if health.local_mode != mode:
+                health.local_generation += 1
+                health.local_mode = mode or "disabled"
+                health.local.probe = ProbeResult()
+                health.managed_tier_transition = False
+                health_check = getattr(self.state, "health_check", None)
+                if health_check is not None:
+                    health_check.wakeup()
+            return
+        tier = await get_managed_parse_server_tier(self.state.config_svc)
+        if (
+            health.local_mode == "managed"
+            and health.managed_tier == tier
+            and health.running_managed_tier == tier
+            and not health.managed_restart_exhausted
+        ):
+            return
+        health.restart_count = 0
+        health.managed_restart_exhausted = False
+        health.begin_managed_tier_transition(tier)
+        health_check = getattr(self.state, "health_check", None)
+        if health_check is not None:
+            health_check.wakeup()
+
+    async def _effective_config_value(self, key: str) -> tuple[str | None, ConfigSource]:
+        if key == REMOTE_API_KEY_CONFIG:
+            resolved = await resolve_remote_api_key(self.state.config_svc)
+            source = "default" if resolved.source == "anonymous" else resolved.source
+            return resolved.value, source
+        return await self.state.config_svc.get(key), await self.state.config_svc.get_source(key)
+
+    async def _validate_config_set(self, key: str, value: str) -> None:
+        validate_config_value(key, value)
+        if key == "parse_server.local.mode":
+            if value == "managed":
+                tier = await get_managed_parse_server_tier(self.state.config_svc)
+                _ensure_managed_parse_server_tier_available(tier, key)
+            return
+
+        if key == "parse_server.local.managed_tier":
+            tier = _validate_managed_parse_server_tier(value, key)
+            _ensure_managed_parse_server_tier_available(tier, key)
+
+    @route("DELETE", "/configs/{key}", tags=("config",))
+    async def unset_config(self, key: str) -> ConfigUnsetResponse:
+        removed = await self.state.config_svc.unset(key)
+        if key in {"parse_server.local.managed_tier", "parse_server.local.mode"}:
+            await self._refresh_managed_tier_transition()
+        value, source = await self._effective_config_value(key)
+        return ConfigUnsetResponse(key=key, value=_mask_config_value(key, value or ""), source=source, removed=removed)
+
+    @route("POST", "/watches", tags=("watches",))
+    async def add_watch(self, request: WatchRequest) -> WatchInfo:
+        await _record_telemetry_count(self.state, "watch.add.count")
+        try:
+            row = await self.state.config_svc.add_watch(request.path, removable=request.removable, label=request.label)
+            scan_svc = getattr(self.state, "scan_svc", None)
+            if scan_svc is not None:
+                await scan_svc.create_scan(row["path"], kind=SCAN_KIND_WATCH, source=SCAN_SOURCE_WATCH, watch_id=row["id"])
+            watch_loop = getattr(self.state, "watch", None)
+            if watch_loop is not None:
+                watch_loop.wakeup()
+            await _record_telemetry_count(self.state, "watch.add.finished.count", dimensions={"status": "succeeded"})
+            return _watch_info(row)
+        except Exception:
+            await _record_telemetry_count(self.state, "watch.add.finished.count", dimensions={"status": "failed"})
+            raise
+
+    @route("GET", "/watches", tags=("watches",))
+    async def list_watches(self) -> WatchListResponse:
+        return WatchListResponse(watches=[_watch_info(row) for row in await self.state.config_svc.list_watches()])
+
+    @route("DELETE", "/watches/{watch_id}", tags=("watches",))
+    async def remove_watch(self, watch_id: int) -> RemoveWatchResponse:
+        await _record_telemetry_count(self.state, "watch.remove.count")
+        try:
+            existing = await self.state.db.fetchone("SELECT id FROM watches WHERE id=?", (watch_id,))
+            if existing is None:
+                raise NotFoundError("watch_not_found", f"Watch target {watch_id} not found.", "watch_id")
+            await self.state.config_svc.remove_watch_by_id(watch_id)
+            watch_loop = getattr(self.state, "watch", None)
+            if watch_loop is not None:
+                watch_loop.wakeup()
+            await _record_telemetry_count(self.state, "watch.remove.finished.count", dimensions={"status": "succeeded"})
+            return RemoveWatchResponse(watch_id=watch_id, removed=True)
+        except Exception:
+            await _record_telemetry_count(self.state, "watch.remove.finished.count", dimensions={"status": "failed"})
+            raise
+
+    @route("POST", "/exclude-rules", tags=("rules",))
+    async def add_exclude_rule(self, request: ExcludeRuleRequest) -> ExcludeRuleInfo:
+        rule_id = await self.state.config_svc.add_rule(
+            request.name or "",
+            RULE_TYPE_EXCLUDE,
+            request.pattern,
+            priority=request.priority,
+        )
+        row = await self.state.db.fetchone("SELECT * FROM exclude_rules WHERE id=?", (rule_id,))
+        return _exclude_rule_info(row)
+
+    @route("GET", "/exclude-rules", tags=("rules",))
+    async def list_exclude_rules(self) -> ExcludeRuleListResponse:
+        rows = await self.state.config_svc.list_rules(RULE_TYPE_EXCLUDE)
+        return ExcludeRuleListResponse(rules=[_exclude_rule_info(row) for row in rows])
+
+    @route("DELETE", "/exclude-rules/{rule_id}", tags=("rules",))
+    async def remove_exclude_rule(self, rule_id: int) -> RemoveExcludeRuleResponse:
+        existing = await self.state.db.fetchone("SELECT id FROM exclude_rules WHERE id=?", (rule_id,))
+        if existing is None:
+            raise NotFoundError("rule_not_found", f"Exclude rule {rule_id} not found.", "rule_id")
+        await self.state.config_svc.remove_rule(rule_id, RULE_TYPE_EXCLUDE)
+        return RemoveExcludeRuleResponse(rule_id=rule_id, removed=True)
+
+    @route("POST", "/parsing-rules", tags=("rules",))
+    async def add_parsing_rule(self, request: ParsingRuleRequest) -> ParsingRuleInfo:
+        rule_id = await self.state.config_svc.add_rule(
+            request.name or "",
+            RULE_TYPE_PARSING_RULE,
+            request.pattern,
+            tier=request.tier,
+            page_range=request.page_range,
+            remote=request.remote,
+            priority=request.priority,
+        )
+        row = await self.state.db.fetchone("SELECT * FROM parsing_rules WHERE id=?", (rule_id,))
+        return _parsing_rule_info(row)
+
+    @route("GET", "/parsing-rules", tags=("rules",))
+    async def list_parsing_rules(self) -> ParsingRuleListResponse:
+        rows = await self.state.config_svc.list_rules(RULE_TYPE_PARSING_RULE)
+        return ParsingRuleListResponse(rules=[_parsing_rule_info(row) for row in rows])
+
+    @route("DELETE", "/parsing-rules/{rule_id}", tags=("rules",))
+    async def remove_parsing_rule(self, rule_id: int) -> RemoveParsingRuleResponse:
+        existing = await self.state.db.fetchone("SELECT id FROM parsing_rules WHERE id=?", (rule_id,))
+        if existing is None:
+            raise NotFoundError("rule_not_found", f"Parsing rule {rule_id} not found.", "rule_id")
+        await self.state.config_svc.remove_rule(rule_id, RULE_TYPE_PARSING_RULE)
+        return RemoveParsingRuleResponse(rule_id=rule_id, removed=True)
+
+    @route("POST", "/cleanup/deleted-files", tags=("cleanup",))
+    async def cleanup_deleted_files(self, request: CleanupDeletedRequest) -> CleanupDeletedResponse:
+        count = await self.state.cleanup_svc.cleanup_deleted(dry_run=request.dry_run)
+        return CleanupDeletedResponse(deleted_files=count, dry_run=request.dry_run)
+
+    @route("POST", "/cleanup/orphan-docs", tags=("cleanup",))
+    async def cleanup_orphan_docs(self, request: CleanupOrphansRequest) -> CleanupOrphansResponse:
+        count = await self.state.cleanup_svc.cleanup_orphans(dry_run=request.dry_run)
+        return CleanupOrphansResponse(orphan_docs=count, dry_run=request.dry_run)
+
+    @route("POST", "/cleanup/temp", tags=("cleanup",))
+    async def cleanup_temp_files(self, request: CleanupTempRequest) -> CleanupTempResponse:
+        count = await self.state.cleanup_svc.cleanup_temp_files(older_than_days=request.older_than_days)
+        return CleanupTempResponse(temp_files_removed=count)
+
+    @route("GET", "/telemetry/status", tags=("telemetry",))
+    async def get_telemetry_status(self) -> TelemetryStatusResponse:
+        status = await self.state.telemetry_svc.status()
+        return TelemetryStatusResponse.model_validate(status)
+
+    @route("GET", "/telemetry/preview", tags=("telemetry",))
+    async def get_telemetry_preview(self) -> TelemetryPreviewResponse:
+        body = await self.state.telemetry_svc.preview_body()
+        return TelemetryPreviewResponse(body=TelemetryPayload.model_validate(body))
+
+    @route("POST", "/telemetry/actions/{action}", tags=("telemetry",))
+    async def telemetry_action(self, action: TelemetryAction) -> TelemetryActionResponse:
+        if action == "enable":
+            result = await self.state.telemetry_svc.set_state("enabled")
+            return TelemetryActionResponse(
+                action=action, reason="environment_override" if result["source"] == "environment" else None, **result
+            )
+        if action == "disable":
+            result = await self.state.telemetry_svc.set_state("disabled")
+            return TelemetryActionResponse(action=action, **result)
+        if action == "notice-shown":
+            result = await self.state.telemetry_svc.acknowledge_notice()
+            return TelemetryActionResponse(action=action, **result)
+        status = await self.state.telemetry_svc.status()
+        if status["state"] != "enabled":
+            return TelemetryActionResponse(
+                action=action,
+                state=status["state"],
+                source=status["source"],
+                installation_id=status["installation_id"],
+                executed=False,
+                reason="telemetry_not_enabled",
+            )
+        flush_result = await self.state.telemetry_svc.flush_once()
+        status = await self.state.telemetry_svc.status()
+        return TelemetryActionResponse(
+            action=action,
+            state=status["state"],
+            source=status["source"],
+            installation_id=status["installation_id"],
+            executed=flush_result.status not in {"disabled", "locked", "no_metrics", "failed"},
+            reason=None if flush_result.status == "success" else flush_result.status,
+            flush_result={
+                "status": flush_result.status,
+                "attempted": flush_result.attempted,
+                "succeeded": flush_result.succeeded,
+                "discarded": flush_result.discarded,
+            },
+        )
+
+    @route("POST", "/observations", tags=("telemetry",))
+    async def record_observations(self, request: TelemetryObservationsRequest) -> TelemetryObservationsResponse:
+        accepted = 0
+        for observation in request.observations:
+            if observation.metric_name == "parse.wait":
+                await self._record_parse_wait_observation(observation)
+                accepted += 1
+                continue
+            if observation.duration_ms is None:
+                await self.state.telemetry_svc.record_count(
+                    observation.metric_name,
+                    value=observation.value,
+                    dimensions=observation.dimensions,
+                )
+            else:
+                await self.state.telemetry_svc.record_duration_bucket(
+                    observation.metric_name,
+                    duration_ms=observation.duration_ms,
+                    dimensions=observation.dimensions,
+                )
+            accepted += 1
+        return TelemetryObservationsResponse(accepted=accepted)
+
+    async def _record_parse_wait_observation(self, observation: TelemetryObservation) -> None:
+        if observation.duration_ms is None or not observation.parse_ids:
+            return
+        placeholders = ",".join("?" * len(observation.parse_ids))
+        rows = cast(
+            list[ParseRow],
+            await self.state.db.fetchall(
+                f"SELECT * FROM parses WHERE id IN ({placeholders}) ORDER BY id ASC",
+                tuple(observation.parse_ids),
+            ),
+        )
+        if not rows:
+            return
+        tier = rows[0]["tier"] if rows[0].get("tier") else "unknown"
+        page_numbers: set[int] = set()
+        for row in rows:
+            try:
+                page_numbers |= parse_page_range_set(row["page_range"])
+            except Exception:
+                continue
+        status = observation.dimensions.get("status") or "unknown"
+        dims = {
+            "status": status,
+            "tier": tier,
+            "pages_bucket": pages_bucket(len(page_numbers) or 1),
+        }
+        await self.state.telemetry_svc.record_count("parse.wait.count", dimensions=dims)
+        await self.state.telemetry_svc.record_duration_bucket(
+            "parse.wait_duration_bucket.count",
+            duration_ms=observation.duration_ms,
+            dimensions=dims,
+        )
+
+    async def _select_parse_rows(
+        self,
+        *,
+        ids: list[int] | None,
+        sha256: str | None,
+        tier: Tier | None,
+        status: ParseStatus | None,
+        include_superseded: bool,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[ParseRow], int, int, int]:
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        clauses: list[str] = []
+        params: list[object] = []
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            rows = cast(
+                list[ParseRow],
+                await self.state.db.fetchall(
+                    f"""
+                    SELECT p.*, d.short_id AS short_id
+                    FROM parses p
+                    JOIN docs d ON d.sha256=p.sha256
+                    WHERE p.id IN ({placeholders})
+                    """,
+                    tuple(ids),
+                ),
+            )
+            by_id = {row["id"]: row for row in rows}
+            ordered = [by_id[parse_id] for parse_id in ids if parse_id in by_id]
+            return ordered[offset : offset + limit], len(ordered), limit, offset
+        if sha256:
+            clauses.append("p.sha256=?")
+            params.append(sha256)
+        if tier:
+            clauses.append("p.tier=?")
+            params.append(tier)
+        if status:
+            clauses.append("p.status=?")
+            params.append(status)
+        elif not include_superseded:
+            clauses.append("p.status!=?")
+            params.append(PARSE_STATUS_SUPERSEDED)
+
+        sql = "SELECT p.*, d.short_id AS short_id FROM parses p JOIN docs d ON d.sha256=p.sha256"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        count_sql = "SELECT COUNT(*) AS cnt FROM parses p JOIN docs d ON d.sha256=p.sha256"
+        if clauses:
+            count_sql += " WHERE " + " AND ".join(clauses)
+        total_row = await self.state.db.fetchone(count_sql, tuple(params))
+        sql += " ORDER BY p.created_at DESC LIMIT ? OFFSET ?"
+        rows = cast(list[ParseRow], await self.state.db.fetchall(sql, (*params, limit, offset)))
+        total = total_row["cnt"] if total_row else 0
+        return rows, total, limit, offset
+
+    async def _sha256_for_path(self, path: str) -> str | None:
+        row = cast(
+            Sha256Row | None,
+            await self.state.db.fetchone("SELECT sha256 FROM files WHERE path=? AND status=?", (path, FILE_STATUS_ACTIVE)),
+        )
+        return row["sha256"] if row and row["sha256"] else None
+
+    async def _doc_for_ref(self, doc_ref: str, *, param: str) -> DocRow:
+        row = await self._maybe_doc_for_ref(doc_ref)
+        if row is None:
+            raise NotFoundError("doc_not_found", f"Document {doc_ref} not found.", param)
+        return row
+
+    async def _maybe_doc_for_ref(self, doc_ref: str) -> DocRow | None:
+        """通过内容服务统一解析完整和短文档标识。"""
+        return await self._content_read_service().find_document(doc_ref)
+
+    async def _resolve_doc_filter_sha256(self, doc_ref: str | None) -> str | None:
+        if doc_ref is None:
+            return None
+        doc = await self._maybe_doc_for_ref(doc_ref)
+        if doc is None:
+            return _NO_MATCHING_DOC_SHA256
+        return doc["sha256"]
+
+    async def _short_id_for_sha256(self, sha256: str) -> str:
+        row = cast(ShortIdRow | None, await self.state.db.fetchone("SELECT short_id FROM docs WHERE sha256=?", (sha256,)))
+        if row is None or not row["short_id"]:
+            raise NotFoundError("doc_not_found", f"Document {sha256} not found.", "sha256")
+        return row["short_id"]
+
+    async def _files_for_sha256(self, sha256: str) -> list[FileInfo]:
+        rows = cast(
+            list[FileRow],
+            await self.state.db.fetchall(
+                """
+                SELECT f.*, d.short_id AS short_id
+                FROM files f
+                JOIN docs d ON d.sha256=f.sha256
+                WHERE f.sha256=? AND f.status=?
+                """,
+                (sha256, FILE_STATUS_ACTIVE),
+            ),
+        )
+        return [_file_info(row) for row in rows]
+
+
+def _mask_config(config: dict[str, str]) -> dict[str, str]:
+    return {key: _mask_config_value(key, value) for key, value in config.items()}
+
+
+def _mask_config_value(key: str, value: str) -> str:
+    if not _is_sensitive_config_key(key) or not value:
+        return value
+    if len(value) <= 12:
+        return "******"
+    return f"{value[:6]}******{value[-6:]}"
+
+
+def _is_sensitive_config_key(key: str) -> bool:
+    lowered = key.lower()
+    return "api_key" in lowered or "token" in lowered or "secret" in lowered or "password" in lowered
+
+
+async def _mineru_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    mineru_error = exc if isinstance(exc, MineruError) else MineruError("internal_error", str(exc))
+    return JSONResponse(status_code=http_status_for(mineru_error.code), content=error_response(mineru_error))
+
+
+async def _unexpected_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=500, content=error_response(MineruError("internal_error", str(exc))))
+
+
+def _parse_server_status(
+    *,
+    local_mode: str,
+    managed_tier: Tier,
+    self_hosted_url: str | None,
+    remote_url: str | None,
+    health: Any,
+) -> ParseServerStatus:
+    local_url = health.managed_url if local_mode == "managed" else self_hosted_url
+    managed_proc = getattr(health, "managed_proc", None)
+    return ParseServerStatus(
+        local=LocalParseServerStatus(
+            mode=local_mode,
+            healthy=health.local.probe.healthy,
+            starting=health.local_starting or (local_mode == "managed" and getattr(health, "managed_tier_transition", False)),
+            started_at=health.local_started_at or None,
+            url=local_url,
+            port=_port_from_url(local_url),
+            managed_pid=managed_proc.pid if managed_proc else None,
+            managed_running=bool(managed_proc and managed_proc.poll() is None),
+            managed_tier=managed_tier,
+            self_hosted_url=self_hosted_url,
+            restart_count=getattr(health, "restart_count", 0),
+            max_restart_attempts=3,
+            last_probe_at=health.local.last_probe_at,
+            last_success_at=health.local.last_success_at,
+            last_failure_at=health.local.last_failure_at,
+            supported_tiers=health.local.probe.tiers,
+            error_code=health.local.probe.error_code,
+            error_msg=health.local.probe.error_msg,
+        ),
+        remote=RemoteParseServerStatus(
+            healthy=health.remote.probe.healthy,
+            url=remote_url,
+            port=_port_from_url(remote_url),
+            last_probe_at=health.remote.last_probe_at,
+            last_success_at=health.remote.last_success_at,
+            last_failure_at=health.remote.last_failure_at,
+            supported_tiers=health.remote.probe.tiers,
+            error_code=health.remote.probe.error_code,
+            error_msg=health.remote.probe.error_msg,
+        ),
+    )
+
+
+def _ensure_managed_parse_server_tier_available(tier: ManagedServerTier, param: str) -> None:
+    """按托管上限检查模型配置，Advanced 复用 Standard 依赖。"""
+    model_tier = model_tier_for_server_tiers((tier,))
+    assert model_tier is not None
+    try:
+        ensure_tier_runtime_dependencies(model_tier)
+    except TierDependencyError as exc:
+        raise InvalidRequestError("parse_server_dependency_missing", str(exc), param) from exc
+    _ensure_managed_parse_server_models_ready(tier, param)
+
+
+def _ensure_managed_parse_server_models_ready(tier: ManagedServerTier, param: str) -> None:
+    """检查上限所需的共享模型，并给出真实可用的模型下载参数。"""
+    model_tier = model_tier_for_server_tiers((tier,))
+    assert model_tier is not None
+    missing_repos: list[str] = []
+    for repo in model_repos_for_tier(model_tier):
+        result = verify_model_repo(repo)
+        if result.ready:
+            continue
+        missing_repos.append(_format_missing_model_repo(repo, result.missing_paths))
+
+    if not missing_repos:
+        return
+
+    details = "; ".join(missing_repos)
+    raise InvalidRequestError(
+        "parse_server_model_not_ready",
+        f"Local managed tier '{tier}' requires model files that are not ready. {details}. "
+        f"Run: mineru-kit models download --tier {model_tier}",
+        param,
+    )
+
+
+def _format_missing_model_repo(repo: ModelRepo, missing_paths: list[str]) -> str:
+    missing = ", ".join(missing_paths)
+    return f"{repo.name} missing: {missing}"
+
+
+def _validate_managed_parse_server_tier(value: str, param: str) -> ManagedServerTier:
+    if value not in MANAGED_SERVER_TIERS:
+        raise InvalidRequestError(
+            "invalid_config_value",
+            "parse_server.local.managed_tier must be one of: basic, standard, advanced.",
+            param,
+        )
+    return cast(ManagedServerTier, value)
+
+
+def _port_from_url(url: str | None) -> int | None:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.port is not None:
+            return parsed.port
+        if parsed.scheme == "http":
+            return 80
+        if parsed.scheme == "https":
+            return 443
+    except ValueError:
+        return None
+    return None
+
+
+def _file_size(path: str) -> int | None:
+    if not path:
+        return None
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+async def _sqlite_journal_mode(db: DatabaseManager) -> str | None:
+    row = await db.fetchone("PRAGMA journal_mode")
+    if not row:
+        return None
+    return cast(str | None, row.get("journal_mode"))
+
+
+def _effective_data_dir(state: Any, config: Config) -> str:
+    data_dir = getattr(state, "data_dir", "")
+    if data_dir:
+        return os.path.expanduser(data_dir)
+    return os.path.expanduser(config.doclib.data_dir)
+
+
+def _tail_log(log_path: str, lines: int = 100) -> list[str]:
+    log_path = os.path.expanduser(log_path)
+    if not os.path.isfile(log_path):
+        return []
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
+        return fh.readlines()[-lines:]
+
+
+async def _watch_stats(db: DatabaseManager, watches: list[WatchTargetRow]) -> list[WatchStats]:
+    file_rows = cast(
+        list[WatchStatsFileRow],
+        await db.fetchall(
+            "SELECT watch_id, "
+            "COUNT(*) AS total_files, "
+            "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS active_files, "
+            "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS deleted_files, "
+            "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS unreachable_files, "
+            "SUM(CASE WHEN status=? AND sha256 IS NULL AND error_code IS NULL THEN 1 ELSE 0 END) AS pending_ingest_files, "
+            "SUM(CASE WHEN error_code IS NOT NULL THEN 1 ELSE 0 END) AS file_error_count, "
+            "COUNT(DISTINCT sha256) AS doc_count "
+            "FROM files WHERE watch_id IS NOT NULL GROUP BY watch_id",
+            (FILE_STATUS_ACTIVE, FILE_STATUS_DELETED, FILE_STATUS_UNREACHABLE, FILE_STATUS_ACTIVE),
+        ),
+    )
+    parse_rows = cast(
+        list[WatchParseCountRow],
+        await db.fetchall(
+            "SELECT f.watch_id AS watch_id, p.status AS status, COUNT(*) AS cnt "
+            "FROM parses p "
+            "JOIN (SELECT DISTINCT watch_id, sha256 FROM files WHERE watch_id IS NOT NULL AND sha256 IS NOT NULL) f "
+            "ON f.sha256 = p.sha256 "
+            "GROUP BY f.watch_id, p.status"
+        ),
+    )
+
+    files_by_watch = {row["watch_id"]: row for row in file_rows}
+    parses_by_watch: dict[int, dict[str, int]] = {}
+    for row in parse_rows:
+        watch_id = row["watch_id"]
+        parses_by_watch.setdefault(watch_id, {})[row["status"]] = row["cnt"]
+
+    stats: list[WatchStats] = []
+    for watch in watches:
+        watch_id = watch["id"]
+        file_counts = files_by_watch.get(watch_id, {})
+        parse_counts = parses_by_watch.get(watch_id, {})
+        stats.append(
+            WatchStats(
+                watch_id=watch_id,
+                path=watch["path"],
+                label=watch.get("label"),
+                removable=bool(watch.get("removable", False)),
+                status=watch["status"],
+                total_files=file_counts.get("total_files", 0) or 0,
+                active_files=file_counts.get("active_files", 0) or 0,
+                deleted_files=file_counts.get("deleted_files", 0) or 0,
+                unreachable_files=file_counts.get("unreachable_files", 0) or 0,
+                pending_ingest_files=file_counts.get("pending_ingest_files", 0) or 0,
+                file_error_count=file_counts.get("file_error_count", 0) or 0,
+                doc_count=file_counts.get("doc_count", 0) or 0,
+                parse_pending_count=parse_counts.get(PARSE_STATUS_PENDING, 0),
+                parse_parsing_count=parse_counts.get(PARSE_STATUS_PARSING, 0),
+                parse_failed_count=parse_counts.get(PARSE_STATUS_FAILED, 0),
+                parse_done_count=parse_counts.get(PARSE_STATUS_DONE, 0),
+                last_scan_at=watch.get("last_scan_at"),
+                last_scan_files=watch.get("last_scan_files", 0) or 0,
+            )
+        )
+    return stats
+
+
+async def _error_summary(db: DatabaseManager) -> ErrorSummary:
+    file_errors = await _error_buckets(db, "files")
+    doc_errors = await _error_buckets(db, "docs")
+    parse_errors = await _error_buckets(db, "parses")
+    return ErrorSummary(file_errors=file_errors, doc_errors=doc_errors, parse_errors=parse_errors)
+
+
+async def _recent_scans(db: DatabaseManager, limit: int = 5) -> list[ScanInfo]:
+    rows = cast(
+        list[RecentScanRow],
+        await db.fetchall(
+            "SELECT id, path, kind, source, watch_id, status, files_seen, files_refreshed, files_new, files_changed, "
+            "files_deleted, files_unreachable, files_error, files_unsupported, files_excluded, error_code, error_msg, "
+            "started_at, finished_at, created_at, updated_at "
+            "FROM scans ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ),
+    )
+    return [ScanInfo.model_validate(row) for row in rows]
+
+
+async def _record_telemetry_count(state: Any, metric_name: str, *, dimensions: dict[str, str] | None = None) -> None:
+    telemetry_svc = getattr(state, "telemetry_svc", None)
+    if telemetry_svc is None:
+        return
+    await telemetry_svc.record_count(metric_name, dimensions=dimensions)
+
+
+async def _record_telemetry_duration(
+    state: Any,
+    metric_name: str,
+    start_ms: int,
+    *,
+    dimensions: dict[str, str] | None = None,
+) -> None:
+    telemetry_svc = getattr(state, "telemetry_svc", None)
+    if telemetry_svc is None:
+        return
+    await telemetry_svc.record_duration_bucket(metric_name, duration_ms=max(0, _now_ms() - start_ms), dimensions=dimensions)
+
+
+def _parse_route_status(response: ParseResponse) -> str:
+    if response.cache_hit:
+        return "cached"
+    if response.created_parse_ids:
+        return "queued"
+    if response.reused_parse_ids:
+        return "reused"
+    return "direct"
+
+
+def _telemetry_error_code(exc: Exception) -> str:
+    if isinstance(exc, MineruError):
+        return exc.code
+    return "internal_error"
+
+
+def _telemetry_output_format(value: str) -> str:
+    if value == "markdown":
+        return "markdown"
+    if value == "image":
+        return "image"
+    return "other"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+async def _error_buckets(db: DatabaseManager, table: str) -> list[ErrorBucket]:
+    sql_by_table = {
+        "files": (
+            "SELECT error_code AS code, COUNT(*) AS cnt FROM files "
+            "WHERE error_code IS NOT NULL GROUP BY error_code ORDER BY cnt DESC, error_code"
+        ),
+        "docs": (
+            "SELECT error_code AS code, COUNT(*) AS cnt FROM docs "
+            "WHERE error_code IS NOT NULL GROUP BY error_code ORDER BY cnt DESC, error_code"
+        ),
+        "parses": (
+            "SELECT error_code AS code, COUNT(*) AS cnt FROM parses "
+            "WHERE error_code IS NOT NULL GROUP BY error_code ORDER BY cnt DESC, error_code"
+        ),
+    }
+    rows = cast(list[ErrorBucketRow], await db.fetchall(sql_by_table[table]))
+    return [ErrorBucket(code=row["code"], count=row["cnt"]) for row in rows]
+
+
+def _file_info(row: FileRow) -> FileInfo:
+    return FileInfo.model_validate(row)
+
+
+def _doc_info(row: DocRow, *, files: list[FileInfo] | None = None) -> DocInfo:
+    data = dict(row)
+    data["files"] = files
+    return DocInfo.model_validate(data)
+
+
+def _parse_info(row: ParseRow, *, coverage: ParseCoverage | None = None) -> ParseInfo:
+    data = dict(row)
+    data["page_range"] = normalize_result_page_range(row["page_range"])
+    data["coverage"] = coverage
+    return ParseInfo.model_validate(data)
+
+
+def _tier_parse_info(row: ParseRow) -> TierParseInfo:
+    data = dict(row)
+    data["page_range"] = normalize_result_page_range(row["page_range"])
+    return TierParseInfo.model_validate(data)
+
+
+def _watch_info(row: WatchTargetRow) -> WatchInfo:
+    data = dict(row)
+    data["removable"] = bool(data.get("removable", False))
+    data["enabled"] = bool(data.get("enabled", True))
+    data["recursive"] = bool(data.get("recursive", False))
+    return WatchInfo.model_validate(data)
+
+
+def _exclude_rule_info(row: ExcludeRuleRow | None) -> ExcludeRuleInfo:
+    if row is None:
+        raise NotFoundError("rule_not_found", "Exclude rule not found.", "rule_id")
+    return ExcludeRuleInfo.model_validate(row)
+
+
+def _parsing_rule_info(row: ParsingRuleRow | None) -> ParsingRuleInfo:
+    if row is None:
+        raise NotFoundError("rule_not_found", "Parsing rule not found.", "rule_id")
+    data = dict(row)
+    data["remote"] = bool(data.get("remote", False))
+    data["enabled"] = bool(data.get("enabled", True))
+    return ParsingRuleInfo.model_validate(data)
+
+
+def _search_result(row: ContentSearchResultRow) -> SearchResult:
+    return SearchResult.model_validate(row)
+
+
+def _find_result(row: FilenameSearchResultRow) -> FindResult:
+    return FindResult.model_validate(row)

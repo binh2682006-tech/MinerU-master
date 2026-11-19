@@ -1,0 +1,124 @@
+name: 🐛 Bug report (English)
+description: Report installation, runtime, or parsing problems
+labels: bug
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [Documentation](https://opendatalab.github.io/MinerU/) · [Discussions](https://github.com/opendatalab/MinerU/discussions) · [AI assistant (optional)](https://deepwiki.com/opendatalab/MinerU)
+
+  - type: checkboxes
+    id: precheck
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing [Issues](https://github.com/opendatalab/MinerU/issues) and [Discussions](https://github.com/opendatalab/MinerU/discussions) and found no matching report.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What went wrong?
+      description: Describe the expected and actual behavior, with relevant errors or screenshots.
+      placeholder: |
+        Expected:
+        Actual:
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        For parsing problems, attach the original document and identify the affected pages or regions.
+        A minimal anonymized sample is fine if it still reproduces the problem.
+        For installation/build problems, provide the commands and complete output; no document is needed.
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Include commands or code, relevant configuration (including OCR mode if known), and reproduction steps.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: usage_entry
+    attributes:
+      label: Usage entry
+      options:
+        - mineru CLI
+        - mineru-kit CLI
+        - Python SDK
+        - API / Router
+        - WebUI
+        - Installation / build
+        - Other / unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os_mode
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other / unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: software_version
+    attributes:
+      label: MinerU version
+      description: Select your actual version, or the target version if installation failed.
+      # BEGIN MINERU_RECENT_RELEASES
+      options:
+        - "4.2.2"
+        - "4.2.1"
+        - "4.2.0"
+        - "4.1.7"
+        - "4.1.6"
+        - "Other / development / unknown"
+      default: 5
+      # END MINERU_RECENT_RELEASES
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Parsing tier
+      options:
+        - flash
+        - basic
+        - standard
+        - advanced
+        - Default selection
+        - Not applicable / unknown
+      default: 5
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Environment diagnostics
+        Run this command where MinerU actually runs, including inside Docker/WSL or on the server:
+        ```shell
+        mineru-kit hardware info
+        ```
+        If installation failed, the command is unavailable, or you cannot access the server, explain why and provide known system, Python, device, backend, and deployment details.
+        Include the exact MinerU version here if you selected “Other / development / unknown”.
+
+  - type: textarea
+    id: device_mode
+    attributes:
+      label: Diagnostic output
+      description: Paste the complete text output, or explain why it is unavailable and provide known environment details.
+      placeholder: Output of mineru-kit hardware info, or the reason it is unavailable.
+      render: text
+    validations:
+      required: true
